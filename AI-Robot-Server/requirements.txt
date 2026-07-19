@@ -1,0 +1,41 @@
+# === Robot AI Server - Requirements ===
+# Python 3.10 - 3.11 рекомендуется
+
+# WebSocket сервер
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+websockets==12.0
+python-multipart==0.0.9
+
+# HTTP запросы (для облачных API)
+requests==2.32.3
+
+# STT - Speech-to-Text (локальный)
+faster-whisper==1.0.3
+
+# TTS - Text-to-Speech (Silero локальный)
+torch==2.3.1
+torchaudio==2.3.1
+
+# TTS - FreeTTS (edge-tts облачный, бесплатный)
+edge-tts==6.1.12
+
+# LLM - Local Language Model
+llama-cpp-python==0.2.85
+
+# Vision
+ultralytics==8.2.50
+mediapipe==0.10.14
+opencv-python==4.10.0.84
+numpy==1.26.4
+Pillow==10.4.0
+
+# Audio processing
+soundfile==0.12.1
+librosa==0.10.2
+webrtcvad==2.0.10
+
+# Utilities
+pydantic==2.8.2
+python-dotenv==1.0.1
+aiofiles==24.1.0

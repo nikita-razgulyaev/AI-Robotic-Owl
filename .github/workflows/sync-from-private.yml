@@ -1,100 +1,125 @@
 name: Sync from Private Repos
 
 on:
-    workflow_dispatch:
-    push:
-        branches: [main, master]
+  workflow_dispatch:
+  repository_dispatch:
+    types: [sync-trigger]
 
 jobs:
-    sync:
-        runs-on: ubuntu-latest
-        steps:
-            - name: Checkout public repo
-              uses: actions/checkout@v4
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout public repo
+        uses: actions/checkout@v4
 
-            # ===== AI-Robot-Server =====
-            - name: Debug SSH key A (проверка)
-              run: |
-                  echo "=== Key length ==="
-                  echo "${{ secrets.REPO_A_SSH_KEY }}" | wc -c
+      # Определяем, какой репозиторий вызвал синхронизацию
+      - name: Determine source repo
+        id: source
+        run: |
+          SOURCE="${{ github.event.client_payload.source }}"
+          COMMIT_MSG="${{ github.event.client_payload.commit_message }}"
+          
+          echo "source=$SOURCE" >> $GITHUB_OUTPUT
+          echo "commit_message=$COMMIT_MSG" >> $GITHUB_OUTPUT
+          
+          echo "Source: $SOURCE"
+          echo "Message: $COMMIT_MSG"
 
-                  echo "=== First line ==="
-                  echo "${{ secrets.REPO_A_SSH_KEY }}" | head -1
+      # ===== AI-Robot-Server (только если это источник) =====
+      - name: Setup SSH key for AI-Robot-Server
+        if: steps.source.outputs.source == 'AI-Robot-Server'
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.REPO_A_SSH_KEY }}" > ~/.ssh/repo_a_key
+          chmod 600 ~/.ssh/repo_a_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
 
-                  echo "=== Last line ==="
-                  echo "${{ secrets.REPO_A_SSH_KEY }}" | tail -1
+      - name: Clone AI-Robot-Server
+        if: steps.source.outputs.source == 'AI-Robot-Server'
+        run: |
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/repo_a_key -o StrictHostKeyChecking=no" \
+          git clone --depth 1 git@github.com:nikita-razgulyaev/AI-Robot-Server.git /tmp/AI-Robot-Server
 
-            - name: Setup SSH key for Repo A
-              run: |
-                  mkdir -p ~/.ssh
-                  printf '%s\n' "${{ secrets.REPO_A_SSH_KEY }}" > ~/.ssh/repo_a_key
-                  chmod 600 ~/.ssh/repo_a_key
-                  ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+      - name: Copy AI-Robot-Server files
+        if: steps.source.outputs.source == 'AI-Robot-Server'
+        run: |
+          mkdir -p AI-Robot-Server
+          rsync -av --delete --exclude='.git' /tmp/AI-Robot-Server/ AI-Robot-Server/
 
-                  echo "=== Key file first line ==="
-                  head -1 ~/.ssh/repo_a_key
+      # ===== 3d-model-for-owl (только если это источник) =====
+      - name: Setup SSH key for 3d-model-for-owl
+        if: steps.source.outputs.source == '3d-model-for-owl'
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.REPO_B_SSH_KEY }}" > ~/.ssh/repo_b_key
+          chmod 600 ~/.ssh/repo_b_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
 
-                  echo "=== Key permissions ==="
-                  ls -la ~/.ssh/repo_a_key
+      - name: Clone 3d-model-for-owl
+        if: steps.source.outputs.source == '3d-model-for-owl'
+        run: |
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/repo_b_key -o StrictHostKeyChecking=no" \
+          git clone --depth 1 git@github.com:nikita-razgulyaev/3d-model-for-owl.git /tmp/3d-model-for-owl
 
-            - name: Test SSH connection to Repo A
-              run: |
-                  ssh -i ~/.ssh/repo_a_key -o StrictHostKeyChecking=no -T git@github.com 2>&1 || true
+      - name: Copy 3d-model-for-owl files
+        if: steps.source.outputs.source == '3d-model-for-owl'
+        run: |
+          mkdir -p 3d-model-for-owl
+          rsync -av --delete --exclude='.git' /tmp/3d-model-for-owl/ 3d-model-for-owl/
 
-            - name: Clone AI-Robot-Server
-              run: |
-                  GIT_SSH_COMMAND="ssh -i ~/.ssh/repo_a_key -o StrictHostKeyChecking=no" \
-                  git clone --depth 1 git@github.com:nikita-razgulyaev/AI-Robot-Server.git /tmp/AI-Robot-Server
+      # ===== arduino-owl-model (только если это источник) =====
+      - name: Setup SSH key for arduino-owl-model
+        if: steps.source.outputs.source == 'arduino-owl-model'
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.REPO_C_SSH_KEY }}" > ~/.ssh/repo_c_key
+          chmod 600 ~/.ssh/repo_c_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
 
-            - name: Copy AI-Robot-Server files
-              run: |
-                  mkdir -p AI-Robot-Server
-                  rsync -av --delete --exclude='.git' /tmp/AI-Robot-Server/ AI-Robot-Server/
+      - name: Clone arduino-owl-model
+        if: steps.source.outputs.source == 'arduino-owl-model'
+        run: |
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/repo_c_key -o StrictHostKeyChecking=no" \
+          git clone --depth 1 git@github.com:nikita-razgulyaev/arduino-owl-model.git /tmp/arduino-owl-model
 
-            # ===== 3d-model-for-owl =====
-            - name: Setup SSH key for Repo B
-              run: |
-                  printf '%s\n' "${{ secrets.REPO_B_SSH_KEY }}" > ~/.ssh/repo_b_key
-                  chmod 600 ~/.ssh/repo_b_key
+      - name: Copy arduino-owl-model files
+        if: steps.source.outputs.source == 'arduino-owl-model'
+        run: |
+          mkdir -p arduino-owl-model
+          rsync -av --delete --exclude='.git' /tmp/arduino-owl-model/ arduino-owl-model/
 
-            - name: Clone 3d-model-for-owl
-              run: |
-                  GIT_SSH_COMMAND="ssh -i ~/.ssh/repo_b_key -o StrictHostKeyChecking=no" \
-                  git clone --depth 1 git@github.com:nikita-razgulyaev/3d-model-for-owl.git /tmp/3d-model-for-owl
-
-            - name: Copy 3d-model-for-owl files
-              run: |
-                  mkdir -p 3d-model-for-owl
-                  rsync -av --delete --exclude='.git' /tmp/3d-model-for-owl/ 3d-model-for-owl/
-
-            # ===== arduino-owl-model =====
-            - name: Setup SSH key for Repo C
-              run: |
-                  printf '%s\n' "${{ secrets.REPO_C_SSH_KEY }}" > ~/.ssh/repo_c_key
-                  chmod 600 ~/.ssh/repo_c_key
-
-            - name: Clone arduino-owl-model
-              run: |
-                  GIT_SSH_COMMAND="ssh -i ~/.ssh/repo_c_key -o StrictHostKeyChecking=no" \
-                  git clone --depth 1 git@github.com:nikita-razgulyaev/arduino-owl-model.git /tmp/arduino-owl-model
-
-            - name: Copy arduino-owl-model files
-              run: |
-                  mkdir -p arduino-owl-model
-                  rsync -av --delete --exclude='.git' /tmp/arduino-owl-model/ arduino-owl-model/
-
-            # ===== Commit and push =====
-            - name: Commit and push
-              run: |
-                  git config user.name "github-actions[bot]"
-                  git config user.email "github-actions[bot]@users.noreply.github.com"
-
-                  git add AI-Robot-Server/ 3d-model-for-owl/ arduino-owl-model/
-
-                  if git diff --cached --quiet; then
-                    echo "Нет изменений"
-                    exit 0
-                  fi
-
-                  git commit -m "Sync from private repos: $(date '+%Y-%m-%d %H:%M:%S')"
-                  git push
+      # ===== Commit and push =====
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          SOURCE="${{ steps.source.outputs.source }}"
+          COMMIT_MSG="${{ steps.source.outputs.commit_message }}"
+          
+          # Определяем, какую папку добавлять
+          if [ "$SOURCE" == "AI-Robot-Server" ]; then
+            git add AI-Robot-Server/
+          elif [ "$SOURCE" == "3d-model-for-owl" ]; then
+            git add 3d-model-for-owl/
+          elif [ "$SOURCE" == "arduino-owl-model" ]; then
+            git add arduino-owl-model/
+          else
+            # Если источник неизвестен — обновляем всё (fallback)
+            git add AI-Robot-Server/ 3d-model-for-owl/ arduino-owl-model/
+            COMMIT_MSG="Sync from private repos: $(date '+%Y-%m-%d %H:%M:%S')"
+          fi
+          
+          if git diff --cached --quiet; then
+            echo "Нет изменений"
+            exit 0
+          fi
+          
+          # Коммит с сообщением из приватного репозитория
+          if [ -n "$COMMIT_MSG" ]; then
+            git commit -m "$COMMIT_MSG"
+          else
+            git commit -m "Sync: $(date '+%Y-%m-%d %H:%M:%S')"
+          fi
+          
+          git push
