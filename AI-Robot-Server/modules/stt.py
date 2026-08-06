@@ -4,7 +4,7 @@ import tempfile
 import os
 from pathlib import Path
 from config.settings import (
-    STT_MODE, WHISPER_MODEL_SIZE, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE
+    STT_MODE, WHISPER_MODEL_SIZE, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE, WHISPER_MODELS
 )
 
 logger = logging.getLogger(__name__)
@@ -13,7 +13,8 @@ logger = logging.getLogger(__name__)
 class LocalSTTEngine:
     """Локальное распознавание речи через faster-whisper"""
 
-    def __init__(self):
+    def __init__(self, model_size: str = None):
+        self.model_size = model_size or WHISPER_MODEL_SIZE
         self.model = None
         self._load_model()
         # Lazy import fuzzy matcher
@@ -29,12 +30,12 @@ class LocalSTTEngine:
 
     def _load_model(self):
         """Загружает Whisper модель"""
-        logger.info(f"Загрузка Whisper: {WHISPER_MODEL_SIZE} ({WHISPER_DEVICE})")
+        logger.info(f"Загрузка Whisper: {self.model_size} ({WHISPER_DEVICE})")
         try:
             from faster_whisper import WhisperModel
 
             self.model = WhisperModel(
-                WHISPER_MODEL_SIZE,
+                self.model_size,
                 device=WHISPER_DEVICE,
                 compute_type=WHISPER_COMPUTE_TYPE
             )
@@ -101,6 +102,7 @@ class STTEngine:
     def __init__(self):
         self.mode = STT_MODE
         self.local_engine = LocalSTTEngine()
+        self.model_id = self.local_engine.model_size
         logger.info("💻 STT режим: ЛОКАЛЬНЫЙ (faster-whisper)")
 
     def set_mode(self, mode: str):
@@ -110,6 +112,15 @@ class STTEngine:
 
     def get_mode(self) -> str:
         return "local"
+
+    def get_current_model_id(self) -> str:
+        return self.model_id
+
+    def set_model(self, model_size: str):
+        """Перезагружает faster-whisper с другим размером модели — сразу, без рестарта сервера"""
+        logger.info(f"🎤 Перезагружаю Whisper: {self.model_id} → {model_size}…")
+        self.local_engine = LocalSTTEngine(model_size)
+        self.model_id = model_size
 
     def transcribe(self, audio_bytes: bytes) -> dict:
         return self.local_engine.transcribe(audio_bytes)

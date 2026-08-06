@@ -35,7 +35,7 @@ class AudioBuffer:
 
         Returns:
             (status, audio_bytes)
-            status: "silence", "speech", "complete"
+            status: "silence", "speech_start", "speech", "complete"
             audio_bytes: накопленное аудио (только при "complete")
         """
         if len(pcm_bytes) != self.chunk_size * 2:
@@ -56,7 +56,9 @@ class AudioBuffer:
                 self.triggered = True
                 self.voiced_frames = list(self.ring_buffer)
                 self.ring_buffer.clear()
-                return "speech", b""
+                # Отдельный статус именно для МОМЕНТА начала новой фразы —
+                # используется, например, для выбора цели слежения по губам.
+                return "speech_start", b""
 
             return "silence", b""
 

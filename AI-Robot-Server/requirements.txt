@@ -1,4 +1,4 @@
-# === Robot AI Server - Requirements ===
+# === Robot AI Server - Requirements v3.5 (с памятью и fine-tuning) ===
 # Python 3.10 - 3.11 рекомендуется
 
 # WebSocket сервер
@@ -18,10 +18,22 @@ torch==2.3.1
 torchaudio==2.3.1
 
 # TTS - FreeTTS (edge-tts облачный, бесплатный)
-edge-tts==6.1.12
+edge-tts>=7.2.8 # неофициальный клиент, Microsoft периодически меняет защиту (Sec-MS-GEC) —
+                 # держим свежую версию, а не жёсткий пин, чтобы фиксы приходили сами
 
 # LLM - Local Language Model
 llama-cpp-python==0.2.85
+
+# === ПАМЯТЬ ===
+qdrant-client==1.9.0  # Векторная БД для долгосрочной памяти
+sentence-transformers==3.0.0  # Эмбеддинги для Qdrant (опционально)
+
+# === FINE-TUNING ===
+peft==0.11.1  # LoRA/QLoRA адаптеры
+transformers==4.41.0  # Для подготовки датасетов
+datasets==2.19.0  # HuggingFace datasets
+accelerate==0.30.0  # Для обучения на GPU
+bitsandbytes==0.43.0  # 4-bit квантизация (QLoRA)
 
 # Vision
 ultralytics==8.2.50

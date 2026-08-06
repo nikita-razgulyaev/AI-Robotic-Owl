@@ -1,0 +1,127 @@
+# Конфигурация Сорена v3.5 — Vector RAG + Qdrant + LoRA
+
+# === Производительность ===
+# fast_mode: true — максимальная скорость ответа. Отключает всё, что не
+# обязательно для самого факта диалога и его тратит время/диск:
+#   - Vector RAG (Qdrant + sentence-transformers энкодер, канон мира)
+#   - Долгосрочная память (Qdrant: диалоги/факты/эмоциональные моменты)
+#   - Сохранение/чтение JSON-профиля пользователя на диск
+#   - Полный системный промпт (Soren.txt, ~9700 симв.) — вместо него
+#     используется короткий (character/Soren_short.txt)
+# Остаётся только короткая память последних реплик в RAM (нужна, чтобы Сорен
+# не забывал, о чём речь в пределах текущего разговора) — она не пишется на
+# диск и не измеряется в него, поэтому не влияет на скорость ответа.
+performance:
+    fast_mode: true
+
+server:
+    host: "0.0.0.0"
+    port: 8765
+
+# === Vector RAG (Qdrant + Sentence-Transformers) ===
+qdrant:
+    path: "./qdrant_storage" # Путь к локальной БД
+    encoder_model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+# === Память ===
+memory:
+    short_term_max: 6 # Макс. реплик в RAM (короткая история для связности диалога)
+    long_term_enabled: false # Qdrant LTM выключен — при fast_mode: true игнорируется в любом случае
+    qdrant_host: "localhost"
+    qdrant_port: 6333
+    collections:
+        emotional_moments: "soren_emotional_moments"
+        dialogue_turns: "soren_dialogue_turns"
+        facts: "soren_facts"
+        rag_chunks: "soren_rag_chunks"
+
+# === Fine-tuning / LoRA ===
+lora:
+    enabled: false
+    # Дообученная (soren_lora_v1.gguf) модель оказалась дефектной — откатились на
+    # базовую qwen2.5-7b-instruct. Если позже появится рабочий адаптер/слитая модель —
+    # укажи путь ниже. path — это путь именно к ОТДЕЛЬНОМУ адаптеру (не к слитой модели,
+    # иначе при enabled=true LoRA применится поверх уже вплавленной версии — задвоение).
+    path: "models/soren_lora_v1.gguf"
+    scale: 1.0
+    rank: 16
+    alpha: 32
+
+# === STT ===
+stt:
+    mode: "local" # local / cloud
+    whisper_model: "small"
+    device: "cpu"
+    compute_type: "int8"
+    # Куратированный список размеров Whisper для выпадающего списка в /panel.
+    # Выбор применяется сразу (faster-whisper перезагружается с новым размером).
+    whisper_models:
+        - id: "tiny"
+          label: "Tiny — максимальная скорость"
+        - id: "base"
+          label: "Base"
+        - id: "small"
+          label: "Small — баланс скорости и точности"
+        - id: "medium"
+          label: "Medium — точнее, медленнее"
+
+# === TTS ===
+tts:
+    mode: "cloud" # local / cloud / edge — облако (edge-tts): не грузит CPU ноутбука синтезом речи
+    silero_speaker: "aidar"
+    silero_pitch_semitones: 1.5
+    silero_rate: 1.05
+    edge_voice: "ru-RU-DmitryNeural"
+    edge_speed: 1.0
+    edge_pitch: "+15Hz"
+
+# === LLM ===
+llm:
+    mode: "cloud" # local / cloud — облако (Hugging Face Inference Providers): секунды на ответ вместо минуты на слабом CPU
+    local_model_path: "models/qwen2.5-7b-instruct-Q4_K_M.gguf" # старая рабочая база (дообученная была дефектной, откат)
+    n_ctx: 2048 # при fast_mode: true промпт короткий (Soren_short.txt, без RAG) — большой контекст больше не нужен
+    n_threads: 4
+    temperature: 0.6
+    repeat_penalty: 1.15
+    # Hugging Face Inference Providers: "<model_id>:<провайдер|fastest|cheapest>".
+    # Llama 3.3 70B Instruct — НЕ reasoning-модель (в отличие от gpt-oss), отвечает сразу,
+    # без скрытой цепочки рассуждений. :fastest уводит на Cerebras/Groq (сотни-тысячи ток/сек).
+    cloud_model: "meta-llama/Llama-3.3-70B-Instruct:fastest"
+    cloud_api_key: "" # Берётся из .env HF_TOKEN (huggingface.co/settings/tokens, право "Make calls to Inference Providers")
+    # Куратированные списки моделей для выпадающего списка в /panel (AI Core).
+    # Выбор в панели применяется сразу — движок перезагружается с новой моделью
+    # без рестарта сервера. "id" — то, что летит в POST /llm_model.
+    local_models:
+        - id: "qwen2.5-7b-q4"
+          label: "Qwen2.5 7B Instruct (Q4_K_M)"
+          path: "models/qwen2.5-7b-instruct-Q4_K_M.gguf"
+    cloud_models:
+        - id: "llama-3.3-70b-fastest"
+          label: "Llama 3.3 70B Instruct (fastest)"
+          model: "meta-llama/Llama-3.3-70B-Instruct:fastest"
+        - id: "gpt-oss-120b-fastest"
+          label: "GPT-OSS 120B (fastest)"
+          model: "openai/gpt-oss-120b:fastest"
+        - id: "qwen2.5-72b-fastest"
+          label: "Qwen2.5 72B Instruct (fastest)"
+          model: "Qwen/Qwen2.5-72B-Instruct:fastest"
+
+# === Vision ===
+vision:
+    pose_tracking: true
+
+# === Audio ===
+audio:
+    sample_rate: 16000
+    chunk_duration_ms: 30
+    vad_aggressiveness: 2
+    silence_timeout_ms: 1500
+
+# === Servos ===
+servos:
+    pca9685_channels: 16
+    pca9685_address: 0x40
+    pca9685_freq: 50
+    extra_pins: [17, 18]
+    min_angle: 0
+    max_angle: 180

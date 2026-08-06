@@ -12,3 +12,6 @@ audio_cache/
 
 # === Environment ===
 .env
+
+# === Auth ===
+config/.session_secret
