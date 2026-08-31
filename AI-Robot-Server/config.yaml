@@ -95,6 +95,9 @@ llm:
         - id: "qwen2.5-7b-q4"
           label: "Qwen2.5 7B Instruct (Q4_K_M)"
           path: "models/qwen2.5-7b-instruct-Q4_K_M.gguf"
+        - id: "mistral-7b-instruct-q4"
+          label: "Mistral 7B Instruct v0.3 (Q4_K_M)"
+          path: "models/mistral-7b-instruct-v0.3.Q4_K_M.gguf"
     cloud_models:
         - id: "llama-3.3-70b-fastest"
           label: "Llama 3.3 70B Instruct (fastest)"
@@ -125,3 +128,24 @@ servos:
     extra_pins: [17, 18]
     min_angle: 0
     max_angle: 180
+
+# === Быстрые ответы (без обращения к LLM) ===
+# Словарь заранее заданных вопросов/команд и ответов на них — character/quick_answers.json.
+# Проверяется ДО памяти и LLM: если находится совпадение (точное или очень похожее),
+# Сорен отвечает мгновенно, без похода в llama.cpp/облако. Удобно для частых вопросов
+# ("как тебя зовут") и команд роботу ("помаши крылом", "кивни").
+quick_answers:
+    enabled: true
+
+# === Подсветка-ночник в подставке (адресная лента) ===
+# Авто-режим: горит, когда устройство подключено к серверу И сейчас между
+# закатом и рассветом для заданных координат. По умолчанию авто-режим
+# ВЫКЛЮЧЕН — ничего не горит само по себе, пока не включат из панели.
+# manual_state — ручное состояние, работает только когда enabled: false.
+backlight:
+    enabled: false
+    manual_state: false
+    latitude: 59.2239    # Вологда
+    longitude: 39.8845
+    timezone: "Europe/Moscow"   # Вологда живёт по московскому времени (UTC+3)
+    check_interval_sec: 60      # как часто пересчитывать закат/рассвет и слать обновление на устройство

@@ -8,6 +8,17 @@ from config.settings import (
 
 logger = logging.getLogger(__name__)
 
+# Минимальная длительность накопленной фразы, чтобы вообще отправлять её в STT.
+MIN_SPEECH_MS = 300
+
+# Окно предзаписи (pre-roll) для триггера speech_start — отдельная, короткая
+# величина, НЕ совпадающая с SILENCE_TIMEOUT_MS (который про таймаут окончания
+# фразы). Раньше ring_buffer ошибочно использовал SILENCE_TIMEOUT_MS и для
+# предзаписи тоже — из-за этого буфер должен был набрать ~800мс подряд ДО
+# триггера, и короткие команды не успевали его заполнить и никогда не
+# распознавались.
+TRIGGER_WINDOW_MS = 300
+
 
 class AudioBuffer:
     """Буфер аудио с VAD для определения начала/конца речи"""
@@ -18,7 +29,7 @@ class AudioBuffer:
         self.chunk_duration_ms = CHUNK_DURATION_MS
         self.chunk_size = int(SAMPLE_RATE * CHUNK_DURATION_MS / 1000)
 
-        self.ring_buffer = collections.deque(maxlen=int(SILENCE_TIMEOUT_MS / CHUNK_DURATION_MS))
+        self.ring_buffer = collections.deque(maxlen=int(TRIGGER_WINDOW_MS / CHUNK_DURATION_MS))
         self.triggered = False
         self.voiced_frames = []
         self.silence_frames = 0
@@ -47,12 +58,21 @@ class AudioBuffer:
         if not self.triggered:
             # Ждём начала речи
             self.ring_buffer.append(pcm_bytes)
+
+            # Оцениваем только когда буфер набрал полное окно — иначе один
+            # ложно распознанный VAD-кадр в начале (щелчок, гул) даёт
+            # 100%-й voiced ratio на выборке из 1-2 чанков и мгновенно
+            # триггерит speech_start. Сравнивать нужно с maxlen (полным
+            # окном), а не с текущей длиной буфера.
+            if len(self.ring_buffer) < self.ring_buffer.maxlen:
+                return "silence", b""
+
             num_voiced = sum(
                 self.vad.is_speech(f, self.sample_rate) 
                 for f in self.ring_buffer
             )
 
-            if num_voiced > 0.9 * len(self.ring_buffer):
+            if num_voiced > 0.9 * self.ring_buffer.maxlen:
                 self.triggered = True
                 self.voiced_frames = list(self.ring_buffer)
                 self.ring_buffer.clear()
@@ -74,7 +94,13 @@ class AudioBuffer:
             if self.silence_frames > self.max_silence_frames:
                 # Речь закончилась
                 audio = b"".join(self.voiced_frames)
+                speech_ms = len(self.voiced_frames) * self.chunk_duration_ms
                 self.reset()
+
+                if speech_ms < MIN_SPEECH_MS:
+                    logger.debug(f"Отброшена короткая фраза: {speech_ms}ms < {MIN_SPEECH_MS}ms")
+                    return "silence", b""
+
                 return "complete", audio
 
             return "speech", b""

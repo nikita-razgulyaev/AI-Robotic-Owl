@@ -5,7 +5,7 @@ import json
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Callable, Awaitable
 from modules.stt import STTEngine
 from modules.tts import TTSEngine
 from modules.llm import LLMEngine
@@ -14,12 +14,15 @@ from modules.audio_buffer import AudioBuffer
 from modules.servo_controller import ServoController
 from modules.memory import MemoryManager
 from modules import memory_flags
+from modules.quick_answers import quick_answers
+from modules.wake_word import strip_wake_word
 from config.settings import (
     CHARACTER_DIR,
     FAST_MODE,
     LLM_LOCAL_MODELS,
     LLM_CLOUD_MODELS,
     WHISPER_MODELS,
+    QUICK_ANSWERS_ENABLED,
     FACE_TRACKING_ENABLED,
     DIALOG_ACTIVE_TIMEOUT_SEC,
     PROVISIONAL_DIALOG_TIMEOUT_SEC,
@@ -102,8 +105,23 @@ class RobotBrain:
         self.is_processing = False
         self.current_emotion = "calm"
 
+        # Кэш последней озвученной фразы — на будущее, для восстановления
+        # передачи после обрыва Wi-Fi (см. audio_resume_request от ESP32).
+        # utterance_id инкрементируется на каждый новый синтез, чтобы файл,
+        # который реально шлёт AUDI-чанки, мог отличить "актуальную" фразу
+        # от устаревшей и повторно отправить именно её, а не всю историю.
+        self.last_tts_audio: bytes = b""
+        self.last_tts_utterance_id: int = 0
+
+        # Коллбэк для доставки кадров анимации на физическое устройство — без
+        # него ServoController.play_animation() работает как чистая Python-
+        # симуляция (hardware_available всегда False), и жесты/анимации
+        # реально не двигают серво. Подключается снаружи в websocket_server.py
+        # (см. startup()), потому что только там есть доступ к device_connections.
+        self.on_servo_frame: Optional[Callable[[List[int]], Awaitable[None]]] = None
+
         # === Фоновые потоки для тяжёлых синхронных операций ===
-        # Не даём CV (YOLO/DNN/FaceMesh) и STT/LLM/TTS блокировать asyncio event loop —
+        # Не даём CV (YOLO/DNN/Pose) и STT/LLM/TTS блокировать asyncio event loop —
         # иначе на время одного тяжёлого вызова встают ВСЕ подключения (панель, /speak, /voice,
         # другие устройства), а не только текущее. Два ОТДЕЛЬНЫХ пула (а не общий executor
         # asyncio), чтобы долгая генерация ответа LLM не задерживала обработку видео —
@@ -172,6 +190,18 @@ class RobotBrain:
         )
         return confirmed_active or provisional_active
 
+    def is_wake_session_active(self) -> bool:
+        """Можно ли обрабатывать команду БЕЗ повторного "Сорен" — та же
+        логика окна, что и у is_dialog_active(), но нарочно только по
+        подтверждённому таймеру (last_interaction_ts), без provisional:
+        одного VAD-сигнала "кто-то говорит" недостаточно, чтобы считать
+        будильник уже произнесённым — сессию открывает только реально
+        распознанная команда (см. mark_dialog_active())."""
+        return (
+            self.last_interaction_ts > 0 and
+            (time.time() - self.last_interaction_ts) < DIALOG_ACTIVE_TIMEOUT_SEC
+        )
+
     def set_stt_mode(self, mode: str):
         self.stt.set_mode(mode)
 
@@ -233,23 +263,28 @@ class RobotBrain:
     def set_tts_speaker(self, speaker: str):
         self.tts.set_speaker(speaker)
 
+    def get_quick_answers_status(self) -> Dict:
+        return {"enabled": QUICK_ANSWERS_ENABLED, "count": quick_answers.count()}
+
+    def reload_quick_answers(self) -> Dict:
+        """Перечитывает character/quick_answers.json с диска — без рестарта сервера"""
+        count = quick_answers.reload()
+        return {"enabled": QUICK_ANSWERS_ENABLED, "count": count}
+
     async def process_audio_chunk(self, pcm_bytes: bytes) -> Optional[dict]:
         status, audio = self.audio_buffer.process_chunk(pcm_bytes)
 
         if status == "speech_start":
-            # Начало новой фразы — включаем режим "слежу по губам, кто говорит"
-            # (используется в vision.process_video_frame для выбора цели слежения)
-            # и сразу продлеваем предварительное окно диалога — голова реагирует
-            # ДО того, как фраза будет распознана.
-            self.vision.notify_speech_start()
+            # Начало новой фразы — сразу продлеваем предварительное окно
+            # диалога, чтобы голова начала реагировать ДО того, как фраза
+            # будет распознана (выбор цели слежения теперь всегда идёт по
+            # размеру лица в кадре — см. VisionEngine._select_target).
             self.mark_dialog_provisional()
         elif status == "speech":
             # Человек продолжает говорить — держим предварительное окно свежим,
             # чтобы оно не истекло на середине длинной фразы.
             self.mark_dialog_provisional()
         elif status == "complete" and audio:
-            # Фраза закончилась — прекращаем перевыбор цели по губам до следующей фразы
-            self.vision.notify_speech_end()
             return await self._process_speech(audio)
 
         return None
@@ -266,7 +301,10 @@ class RobotBrain:
             # поэтому анимацию запускаем здесь, а не внутри воркер-потока.
             action = result.get("action")
             if action:
-                asyncio.create_task(self.servos.play_animation(action))
+                asyncio.create_task(self.servos.play_animation(action, on_frame=self.on_servo_frame))
+            else:
+                # Явно доставляем эмоциональную позу на ESP32 (из потока коллбэк не ушёл)
+                await self._notify_servo_frame()
 
             return result
         finally:
@@ -287,14 +325,27 @@ class RobotBrain:
         if user_text != raw_text:
             logger.info(f"🎯 Fuzzy: используем исправленный текст: '{user_text}'")
 
-        logger.info(f"Пользователь: {user_text}")
+        # Будильник "Сорен" — команды принимаются только сразу после него,
+        # либо пока открыта сессия диалога (см. is_wake_session_active).
+        # Иначе случайная реплика в комнате ("а он вообще слушает?") не
+        # должна улетать в LLM.
+        command_text = strip_wake_word(user_text)
+        if command_text is None:
+            if self.is_wake_session_active():
+                command_text = user_text
+            else:
+                logger.info(f"🔇 Будильник не найден, фраза проигнорирована: '{user_text}'")
+                return self._build_empty_response()
+        else:
+            logger.info(f"👂 Будильник распознан: '{user_text}' → '{command_text or '(пусто)'}'")
+
+        logger.info(f"Пользователь: {command_text or '(только будильник, без команды)'}")
         self.mark_dialog_active()
 
-        # Собираем полный контекст памяти
-        memory_context = self._build_memory_context(user_text)
+        # Словарь быстрых ответов → память → LLM — вся логика теперь в одном
+        # месте (см. generate_reply), чтобы не размножать её по каждой точке входа.
+        llm_result = self.generate_reply(command_text)
 
-        logger.info("Генерация ответа Сорена...")
-        llm_result = self.llm.generate(user_text, self.vision_context, memory_context)
         response_text = llm_result["text"]
         action = llm_result.get("action")
         emotion = llm_result.get("emotion", "calm")
@@ -312,6 +363,9 @@ class RobotBrain:
         tts_audio = self.tts.synthesize(response_text)
 
         if tts_audio:
+            self.last_tts_audio = tts_audio
+            self.last_tts_utterance_id += 1
+
             # Продлеваем подтверждённое окно диалога на время самого озвучивания ответа —
             # оба TTS-движка отдают PCM 16-bit mono 48kHz (см. modules/tts.py), поэтому
             # длительность оцениваем как байты / (48000 * 2). Так голова не "отключится"
@@ -320,8 +374,9 @@ class RobotBrain:
             self.last_interaction_ts = time.time() + estimated_playback_sec
 
         if not action:
-            # Анимацию (если есть) запустит async-обёртка _process_speech — ей нужен event loop
-            self.servos.set_all_servos(servo_angles)
+            # Анимацию (если есть) запустит async-обёртка _process_speech — ей нужен event loop.
+            # notify=False, т.к. мы в фоновом потоке без event loop — уведомим вручную после return.
+            self.servos.set_all_servos(servo_angles, notify=False)
 
         return {
             "text": user_text,
@@ -333,6 +388,52 @@ class RobotBrain:
             "servo_angles": servo_angles,
             "eye_led": eye_led
         }
+
+    def _try_quick_answer(self, user_text: str) -> Optional[dict]:
+        """Проверяет словарь быстрых ответов (character/quick_answers.json) ДО
+        похода в память и LLM. Если находится совпадение — Сорен отвечает
+        мгновенно, без единого обращения к llama.cpp/облаку. Возвращает dict
+        в том же формате, что и LLMEngine.generate(), либо None (тогда
+        вызывающий код идёт обычным путём через LLM)."""
+        if not QUICK_ANSWERS_ENABLED:
+            return None
+
+        qa = quick_answers.find(user_text)
+        if qa is None:
+            return None
+
+        logger.info(f"⚡ Быстрый ответ '{qa.id}' (без LLM): {user_text!r} → {qa.response!r}")
+        return {"text": qa.response, "action": qa.action, "emotion": qa.emotion or "calm"}
+
+    def generate_reply(self, user_text: str) -> dict:
+        """Единая точка получения ответа Сорена на текст пользователя — сначала
+        словарь быстрых ответов, затем (если не сработало) память + LLM.
+
+        ВАЖНО: это единственное место, где должен вызываться self.llm.generate().
+        Все остальные точки входа (голос, текстовый чат по WS, HTTP /speak,
+        HTTP /voice) обязаны идти через этот метод, а не звать
+        self.llm.generate() напрямую — иначе словарь быстрых ответов будет
+        молча пропущен именно для этого пути (см. историю бага: /speak и
+        /voice изначально звали LLM напрямую и словарь на них не действовал).
+
+        Возвращает dict {"text", "action", "emotion"} — тот же формат,
+        что и LLMEngine.generate().
+
+        user_text == "" — особый случай: будильник "Сорен" был произнесён/
+        написан без команды следом (позвали по имени). Отвечаем коротким
+        "Да?" без похода в quick_answers/LLM — там всё равно нечего искать.
+        """
+        if not user_text.strip():
+            return {"text": "Да?", "action": None, "emotion": "calm"}
+
+        quick = self._try_quick_answer(user_text)
+        if quick is not None:
+            if self.memory:
+                self.memory.record_interaction(user_text, quick["text"], quick["emotion"])
+            return quick
+
+        memory_context = self._build_memory_context(user_text)
+        return self.llm.generate(user_text, self.vision_context, memory_context)
 
     def _build_memory_context(self, user_text: str) -> str:
         """Собирает контекст для LLM из памяти — каждый уровень (stm/ltm/profile)
@@ -367,18 +468,21 @@ class RobotBrain:
 
     def _handle_text_command_sync(self, user_text: str) -> dict:
         """Синхронное тело обработки текстовой команды (LLM+TTS) — выполняется в фоновом потоке"""
-        # Собираем контекст памяти
-        memory_context = self._build_memory_context(user_text)
+        llm_result = self.generate_reply(user_text)
 
-        llm_result = self.llm.generate(user_text, self.vision_context, memory_context)
         emotion = llm_result.get("emotion", "calm")
         servo_angles = self.emotion_engine.get_servo_angles(emotion)
         eye_led = self.emotion_engine.get_eye_led(emotion)
         tts_audio = self.tts.synthesize(llm_result["text"])
 
+        if tts_audio:
+            self.last_tts_audio = tts_audio
+            self.last_tts_utterance_id += 1
+
         if not llm_result.get("action"):
-            # Анимацию (если есть) запустит handle_command — ей нужен event loop
-            self.servos.set_all_servos(servo_angles)
+            # Анимацию (если есть) запустит handle_command — ей нужен event loop.
+            # notify=False, т.к. мы в фоновом потоке — уведомим вручную после return.
+            self.servos.set_all_servos(servo_angles, notify=False)
 
         return {
             "response": llm_result["text"],
@@ -403,7 +507,7 @@ class RobotBrain:
 
     async def process_video_frame(self, frame_bytes: bytes) -> dict:
         loop = asyncio.get_event_loop()
-        # CV-обработка (YOLO/DNN-детектор лица/FaceMesh/Pose) — тяжёлая и синхронная,
+        # CV-обработка (YOLO/DNN-детектор лица/Pose) — тяжёлая и синхронная,
         # выполняем в отдельном потоке, чтобы не блокировать event loop на время кадра.
         return await loop.run_in_executor(self._cv_executor, self._process_video_frame_sync, frame_bytes)
 
@@ -419,13 +523,17 @@ class RobotBrain:
         # Слежение за лицом включается ТОЛЬКО во время активного диалога
         dialog_active = FACE_TRACKING_ENABLED and self.is_dialog_active()
 
-        # Углы рук/плеч из позы тела применяются независимо от диалога,
-        # а голову (pan/tilt) двигаем только когда реально следим за лицом —
-        # иначе оставляем её в текущем положении, не дёргая робота.
-        pose_angles = self.vision.get_servo_angles_from_pose()
+        # Раньше здесь Y-координаты плеч/локтей человека (MediaPipe Pose)
+        # автоматически лились в L_FLAP/L_FOLD/R_FLAP/R_FOLD (крылья, 0-3) —
+        # каждый кадр, пока в кадре есть человек. Поскольку поза тела и лицо
+        # детектируются на одном и том же кадре с одним и тем же человеком,
+        # крылья по факту дёргались синхронно с обнаружением лица — то, чего
+        # быть не должно (см. запрос: единственные сервы, реагирующие на
+        # зрение, — голова). Автоматическое зеркалирование позы в крылья
+        # убрано; get_servo_angles_from_pose() в vision.py оставлена как есть
+        # на случай, если понадобится явная поза/жест по команде, но сама по
+        # себе она больше нигде не вызывается из видео-пайплайна.
         servo_angles = self.servos.get_current_angles()
-        for i in range(16):
-            servo_angles[i] = pose_angles[i]
 
         if dialog_active and face_detected:
             # "Снап" в центр нового лица — без сглаживания и без мёртвой зоны —
@@ -527,11 +635,10 @@ class RobotBrain:
             return {"status": "ok", "angles": command["angles"]}
 
         elif cmd_type == "animation":
-            asyncio.create_task(self.servos.play_animation(command["name"]))
+            asyncio.create_task(self.servos.play_animation(command["name"], on_frame=self.on_servo_frame))
             return {"status": "ok", "animation": command["name"]}
 
         elif cmd_type == "text":
-            self.mark_dialog_active()
             try:
                 from modules.fuzzy_matcher import correct_speech_text
                 raw_text = command["text"]
@@ -542,25 +649,46 @@ class RobotBrain:
             except ImportError:
                 user_text = command["text"]
 
-            loop = asyncio.get_event_loop()
-            # LLM.generate + TTS.synthesize — те же тяжёлые блокирующие вызовы, что и в
-            # голосовом пути (_process_speech), тем же приёмом уводим их в фоновый поток.
-            result = await loop.run_in_executor(self._speech_executor, self._handle_text_command_sync, user_text)
+            # Тот же будильник "Сорен", что и в голосовом пути — для
+            # единообразия он нужен и в текстовых командах с панели.
+            command_text = strip_wake_word(user_text)
+            if command_text is None:
+                if self.is_wake_session_active():
+                    command_text = user_text
+                else:
+                    return {
+                        "status": "ignored",
+                        "message": "Команда проигнорирована: нет будильника 'Сорен'",
+                        "text": user_text,
+                    }
 
-            if result.get("action"):
-                asyncio.create_task(self.servos.play_animation(result["action"]))
+            self.mark_dialog_active()
+            self.is_processing = True
+            try:
+                loop = asyncio.get_event_loop()
+                # LLM.generate + TTS.synthesize — те же тяжёлые блокирующие вызовы, что и в
+                # голосовом пути (_process_speech), тем же приёмом уводим их в фоновый поток.
+                result = await loop.run_in_executor(self._speech_executor, self._handle_text_command_sync, command_text)
 
-            return {
-                "status": "ok",
-                "text": user_text,
-                "raw_text": command.get("text", ""),
-                "response": result["response"],
-                "audio": result["audio"].hex() if result["audio"] else "",
-                "action": result.get("action"),
-                "emotion": result["emotion"],
-                "servo_angles": result["servo_angles"],
-                "eye_led": result["eye_led"]
-            }
+                if result.get("action"):
+                    asyncio.create_task(self.servos.play_animation(result["action"], on_frame=self.on_servo_frame))
+                else:
+                    # Явно доставляем эмоциональную позу на ESP32 (из потока коллбэк не ушёл)
+                    await self._notify_servo_frame()
+
+                return {
+                    "status": "ok",
+                    "text": command_text,
+                    "raw_text": command.get("text", ""),
+                    "response": result["response"],
+                    "audio": result["audio"].hex() if result["audio"] else "",
+                    "action": result.get("action"),
+                    "emotion": result["emotion"],
+                    "servo_angles": result["servo_angles"],
+                    "eye_led": result["eye_led"]
+                }
+            finally:
+                self.is_processing = False
 
         elif cmd_type == "get_status":
             return {
@@ -573,7 +701,8 @@ class RobotBrain:
                 "memory": self.memory.short_term.get_summary() if self.memory else {},
                 "ltm_enabled": self.memory.long_term.enabled if self.memory else False,
                 "memory_flags": self.get_memory_flags(),
-                "model_config": self.get_model_config()
+                "model_config": self.get_model_config(),
+                "quick_answers": self.get_quick_answers_status()
             }
 
         elif cmd_type == "clear_history":
@@ -629,8 +758,26 @@ class RobotBrain:
             self.set_tts_speaker(speaker)
             return {"status": "ok", "model_config": self.get_model_config()}
 
+        elif cmd_type == "reload_quick_answers":
+            return {"status": "ok", "quick_answers": self.reload_quick_answers()}
+
         else:
             return {"status": "error", "message": f"Неизвестная команда: {cmd_type}"}
+
+    async def _notify_servo_frame(self):
+        """Явно рассылает текущие углы серво на физическое устройство.
+        Используется после возврата из фонового потока _speech_executor,
+        где asyncio event loop недоступен и _notify_servo_frame внутри
+        ServoController молча проглатывается."""
+        if self.on_servo_frame:
+            await self.on_servo_frame(self.servos.get_current_angles())
+
+    def get_last_tts_audio(self) -> tuple:
+        """Возвращает (utterance_id, audio_bytes) последней озвученной фразы —
+        для повторной отправки по запросу ESP32 после обрыва Wi-Fi
+        (audio_resume_request). utterance_id=0 значит, что ещё ничего не
+        озвучивалось."""
+        return self.last_tts_utterance_id, self.last_tts_audio
 
     def shutdown(self):
         logger.info("Завершение работы RobotBrain...")

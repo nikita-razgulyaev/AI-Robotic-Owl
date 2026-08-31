@@ -9,6 +9,31 @@ from config.settings import (
 
 logger = logging.getLogger(__name__)
 
+# Порог "вероятности отсутствия речи" от самого Whisper (усреднённый по сегментам
+# no_speech_prob). Выше этого — модель сама не уверена, что там вообще была речь,
+# такое почти всегда шум/тишина, даже если что-то "распозналось".
+NO_SPEECH_PROB_THRESHOLD = 0.6
+
+# Известные галлюцинации faster-whisper на тишине/шуме для русского языка —
+# модель обучена в том числе на субтитрах с YouTube и на пустом/шумном входе
+# вместо пустой строки часто выдаёт титровые фразы вроде этих. Точное или
+# частичное совпадение → результат отбрасывается как "речь не распознана".
+HALLUCINATION_PATTERNS = [
+    "редактор субтитров",
+    "корректор",
+    "субтитры сделал",
+    "субтитры создавал",
+    "продолжение следует",
+    "спасибо за просмотр",
+    "подписывайтесь на канал",
+    "ставьте лайк",
+]
+
+
+def _looks_like_hallucination(text: str) -> bool:
+    lowered = text.lower()
+    return any(pattern in lowered for pattern in HALLUCINATION_PATTERNS)
+
 
 class LocalSTTEngine:
     """Локальное распознавание речи через faster-whisper"""
@@ -72,7 +97,21 @@ class LocalSTTEngine:
 
         try:
             segments, info = self.model.transcribe(audio_path, language="ru", beam_size=5)
-            text = " ".join([segment.text for segment in segments]).strip()
+            segments = list(segments)  # generator -> список, нужен для двух проходов
+            text = " ".join(segment.text for segment in segments).strip()
+
+            if segments:
+                avg_no_speech_prob = sum(s.no_speech_prob for s in segments) / len(segments)
+                if avg_no_speech_prob > NO_SPEECH_PROB_THRESHOLD:
+                    logger.info(
+                        f"🔇 STT отклонён — no_speech_prob={avg_no_speech_prob:.2f} "
+                        f"(похоже на шум/тишину): '{text}'"
+                    )
+                    return {"success": False, "text": "", "corrected_text": "", "error": "Речь не распознана"}
+
+            if text and _looks_like_hallucination(text):
+                logger.info(f"🔇 STT отклонён — похоже на галлюцинацию Whisper: '{text}'")
+                return {"success": False, "text": "", "corrected_text": "", "error": "Речь не распознана"}
 
             if text:
                 corrected_text = self.correct_text(text) if self.fuzzy_available else text

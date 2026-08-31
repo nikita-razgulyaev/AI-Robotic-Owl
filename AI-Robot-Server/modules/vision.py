@@ -1,4 +1,4 @@
-"""Vision модуль - обработка видео: YOLO + MediaPipe (поза) + OpenCV (лицо, трекинг, губы)"""
+"""Vision модуль - обработка видео: YOLO + MediaPipe (поза) + OpenCV (лицо, трекинг)"""
 import cv2
 import time
 import logging
@@ -17,8 +17,6 @@ from config.settings import (
     FACE_CASCADE_MIN_SIZE,
     FACE_TRACKER_MAX_DISTANCE,
     FACE_TRACKER_MAX_MISSED_FRAMES,
-    LIP_ACTIVITY_WINDOW_SEC,
-    MIN_LIP_SAMPLES_FOR_DECISION,
     YOLO_DETECTION_INTERVAL_SEC,
     POSE_DETECTION_INTERVAL_SEC,
 )
@@ -44,10 +42,8 @@ _COLOR_TRACKING = (46, 204, 113)
 _COLOR_IDLE = (140, 140, 140)
 _COLOR_OTHER = (90, 90, 90)
 
-_LIP_TOP = 13
-_LIP_BOTTOM = 14
-_LIP_LEFT = 61
-_LIP_RIGHT = 291
+# FIX: панельный кадр считается "свежим" только в течение этого времени.
+PANEL_FRAME_MAX_AGE_SEC = 3.0
 
 
 class VisionEngine:
@@ -56,7 +52,6 @@ class VisionEngine:
     def __init__(self):
         self.yolo = None
         self.pose = None
-        self.face_mesh = None
         self.face_detector_net = None
         self.face_cascade = None
 
@@ -74,18 +69,14 @@ class VisionEngine:
 
         self._init_face_detector()
 
-        if MEDIAPIPE_AVAILABLE:
-            if ENABLE_POSE_TRACKING:
-                self._try_init_pose()
-            self._try_init_face_mesh()
+        if MEDIAPIPE_AVAILABLE and ENABLE_POSE_TRACKING:
+            self._try_init_pose()
 
         self.tracker = FaceTracker(
             max_distance=FACE_TRACKER_MAX_DISTANCE,
             max_missed_frames=FACE_TRACKER_MAX_MISSED_FRAMES,
-            lip_window_sec=LIP_ACTIVITY_WINDOW_SEC,
         )
         self.target_track_id: Optional[int] = None
-        self.speech_episode_active: bool = False
 
         self.last_pose_landmarks = None
         self.person_detected = False
@@ -94,23 +85,13 @@ class VisionEngine:
         self.all_faces_bbox: List[Tuple[int, int, int, int]] = []
         self.last_frame = None
 
-        # === Поддержка двух видеопотоков от ESP32 (если прошивка обновлена) ===
-        # "VIDE" (частый, маленькое разрешение) → self.last_frame, используется для
-        # детекции. "VIDP" (редкий, покрупнее, только для человека) → self._panel_frame.
-        # Bbox всегда считается в системе координат last_frame на момент детекции
-        # (self._detection_frame_size) и масштабируется под фактический размер кадра
-        # панели при отрисовке — так что если прошивка НЕ обновлена и VIDP не приходит,
-        # всё работает ровно как раньше (self._panel_frame остаётся None → fallback на last_frame).
         self._panel_frame = None
-        self._detection_frame_size: Optional[Tuple[int, int]] = None  # (w, h)
+        self._panel_frame_ts: Optional[float] = None
+        self._detection_frame_size: Optional[Tuple[int, int]] = None
 
-        # Троттлинг тяжёлых детекторов (YOLO/Pose не гоняем на каждый кадр —
-        # см. YOLO_DETECTION_INTERVAL_SEC / POSE_DETECTION_INTERVAL_SEC).
-        # Лицо/трекер/губы намеренно НЕ троттлятся — от их частоты зависит
-        # плавность слежения и скорость выбора говорящего.
         self._last_yolo_run_ts = 0.0
         self._last_pose_run_ts = 0.0
-        self._cached_objects: List[Dict] = []  # последний результат YOLO (переиспользуется между запусками)
+        self._cached_objects: List[Dict] = []
 
     def _init_face_detector(self):
         if FACE_DETECTOR_PROTOTXT.exists() and FACE_DETECTOR_MODEL.exists():
@@ -160,23 +141,6 @@ class VisionEngine:
             logger.warning(f"MediaPipe Pose не удалось инициализировать: {e}")
             self.pose = None
 
-    def _try_init_face_mesh(self):
-        try:
-            self.face_mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=False,
-                max_num_faces=1,
-                refine_landmarks=False,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5
-            )
-            logger.info("MediaPipe FaceMesh инициализирован (точный детектор движения губ)")
-        except AttributeError:
-            logger.info("MediaPipe FaceMesh недоступен — активность губ считается через OpenCV (разница пикселей ROI)")
-            self.face_mesh = None
-        except Exception as e:
-            logger.warning(f"MediaPipe FaceMesh не удалось инициализировать: {e}")
-            self.face_mesh = None
-
     def _detect_faces(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
         h, w = frame.shape[:2]
         boxes: List[Tuple[int, int, int, int]] = []
@@ -219,84 +183,29 @@ class VisionEngine:
 
         return boxes
 
-    def _update_lip_activity(self, frame: np.ndarray, track: FaceTrack):
-        x, y, w_, h_ = track.bbox
-        if w_ <= 0 or h_ <= 0:
-            return
-
-        if self.face_mesh is not None:
-            try:
-                pad_x, pad_y = int(w_ * 0.15), int(h_ * 0.15)
-                x0, y0 = max(0, x - pad_x), max(0, y - pad_y)
-                x1, y1 = min(frame.shape[1], x + w_ + pad_x), min(frame.shape[0], y + h_ + pad_y)
-                crop = frame[y0:y1, x0:x1]
-                if crop.size == 0:
-                    return
-                rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-                mesh_result = self.face_mesh.process(rgb)
-                if mesh_result and mesh_result.multi_face_landmarks:
-                    lm = mesh_result.multi_face_landmarks[0].landmark
-                    ch, cw = crop.shape[:2]
-                    vert = abs(lm[_LIP_BOTTOM].y - lm[_LIP_TOP].y) * ch
-                    horiz = abs(lm[_LIP_RIGHT].x - lm[_LIP_LEFT].x) * cw
-                    ratio = vert / horiz if horiz > 1e-3 else 0.0
-
-                    prev_ratio = getattr(track, "_last_mouth_ratio", None)
-                    track._last_mouth_ratio = ratio
-                    activity = abs(ratio - prev_ratio) if prev_ratio is not None else 0.0
-                    track.add_lip_sample(activity)
-                return
-            except Exception as e:
-                logger.debug(f"FaceMesh (губы) ошибка: {e}")
-
-        try:
-            mouth_y0 = max(0, y + int(h_ * 0.62))
-            mouth_y1 = min(frame.shape[0], y + int(h_ * 0.95))
-            mouth_x0 = max(0, x + int(w_ * 0.22))
-            mouth_x1 = min(frame.shape[1], x + int(w_ * 0.78))
-            if mouth_y1 <= mouth_y0 or mouth_x1 <= mouth_x0:
-                return
-            roi = cv2.cvtColor(frame[mouth_y0:mouth_y1, mouth_x0:mouth_x1], cv2.COLOR_BGR2GRAY)
-            roi = cv2.resize(roi, (40, 24))
-            if track.prev_mouth_roi is not None:
-                diff = cv2.absdiff(roi, track.prev_mouth_roi)
-                track.add_lip_sample(float(np.mean(diff)))
-            track.prev_mouth_roi = roi
-        except Exception as e:
-            logger.debug(f"Fallback разница пикселей рта ошибка: {e}")
-
     def update_panel_frame(self, frame_bytes: bytes) -> bool:
         """Принимает более качественный/крупный кадр ТОЛЬКО для показа в панели мониторинга
-        (тег VIDP от прошивки). НЕ запускает детекцию — просто обновляет картинку,
-        которую get_annotated_jpeg() использует как фон (bbox масштабируется отдельно)."""
+        (тег VIDP от прошивки). НЕ запускает детекцию — просто обновляет картинку."""
         try:
             nparr = np.frombuffer(frame_bytes, np.uint8)
             frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             if frame is None:
                 return False
+            # FIX: поворот 90° вправо (по запросу — камера установлена на боку)
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
             self._panel_frame = frame
+            self._panel_frame_ts = time.time()
             return True
         except Exception as e:
             logger.error(f"Ошибка декодирования кадра панели (VIDP): {e}")
             return False
 
-    def notify_speech_start(self):
-        self.speech_episode_active = True
-
-    def notify_speech_end(self):
-        self.speech_episode_active = False
-
     def _select_target(self, tracks: List[FaceTrack]):
+        """Держит текущую цель, пока она видна; если пропала — выбирает
+        самое крупное лицо в кадре (обычно ближайший к камере человек)."""
         if not tracks:
             self.target_track_id = None
             return
-
-        if self.speech_episode_active:
-            candidates = [t for t in tracks if t.sample_count() >= MIN_LIP_SAMPLES_FOR_DECISION]
-            if candidates:
-                best = max(candidates, key=lambda t: t.lip_activity_score())
-                self.target_track_id = best.id
-                return
 
         current = self.tracker.get_track(self.target_track_id) if self.target_track_id is not None else None
         if current is not None and current.missed_frames == 0:
@@ -312,8 +221,11 @@ class VisionEngine:
             if frame is None:
                 return {"error": "Не удалось декодировать кадр"}
 
+            # FIX: поворот 90° вправо (камера установлена на боку)
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+
             self.last_frame = frame
-            self._detection_frame_size = (frame.shape[1], frame.shape[0])  # (w, h)
+            self._detection_frame_size = (frame.shape[1], frame.shape[0])
 
             result = {
                 "objects": [],
@@ -326,9 +238,7 @@ class VisionEngine:
                 "description": ""
             }
 
-            # 1. YOLO Detection (троттлится — см. YOLO_DETECTION_INTERVAL_SEC,
-            # результат нужен только для текстового описания сцены для LLM,
-            # частая переоценка не требуется)
+            # 1. YOLO Detection (троттлится)
             now = time.time()
             if self.yolo is not None and (now - self._last_yolo_run_ts) >= YOLO_DETECTION_INTERVAL_SEC:
                 self._last_yolo_run_ts = now
@@ -355,12 +265,9 @@ class VisionEngine:
                     logger.error(f"Ошибка YOLO: {e}")
             result["objects"] = self._cached_objects
 
-            # 2. Детекция лиц (DNN/Haar) + трекинг между кадрами + активность губ + выбор цели
-            # (намеренно НЕ троттлится — см. комментарий в __init__)
+            # 2. Детекция лиц + трекинг + выбор цели
             face_boxes = self._detect_faces(frame)
             tracks = self.tracker.update(face_boxes)
-            for track in tracks:
-                self._update_lip_activity(frame, track)
             self._select_target(tracks)
 
             self.all_faces_bbox = [t.bbox for t in tracks]
@@ -379,8 +286,7 @@ class VisionEngine:
                 self.face_position = None
                 self.face_bbox = None
 
-            # 3. Pose Tracking (троттлится — см. POSE_DETECTION_INTERVAL_SEC;
-            # руки/плечи не требуют такой же реакции, как голова)
+            # 3. Pose Tracking (троттлится)
             if self.pose is not None and (now - self._last_pose_run_ts) >= POSE_DETECTION_INTERVAL_SEC:
                 self._last_pose_run_ts = now
                 try:
@@ -430,17 +336,20 @@ class VisionEngine:
         return "; ".join(parts)
 
     def get_annotated_jpeg(self, tracking_active: bool = False, quality: int = 70) -> Optional[bytes]:
-        # Показываем кадр панели (крупнее, реже), если прошивка его присылает;
-        # иначе — обычный кадр детекции (полностью обратная совместимость).
-        base_frame = self._panel_frame if self._panel_frame is not None else self.last_frame
+        base_frame = self.last_frame
+        if self._panel_frame is not None and self._panel_frame_ts is not None:
+            age = time.time() - self._panel_frame_ts
+            if age < PANEL_FRAME_MAX_AGE_SEC:
+                base_frame = self._panel_frame
+            else:
+                logger.debug(f"Панельный кадр устарел ({age:.1f}s), используем last_frame")
+
         if base_frame is None:
             return None
 
         frame = base_frame.copy()
         target_bbox = self.face_bbox
 
-        # Bbox посчитан в системе координат last_frame (кадра детекции) — если панель
-        # показывает кадр ДРУГОГО размера (VIDP), масштабируем координаты пропорционально.
         scale_x, scale_y = 1.0, 1.0
         if self._detection_frame_size is not None:
             det_w, det_h = self._detection_frame_size
@@ -487,6 +396,12 @@ class VisionEngine:
         return (offset_x, offset_y)
 
     def get_servo_angles_from_pose(self) -> List[int]:
+        """Углы серв ТОЛЬКО плеч/локтей (0-3) из MediaPipe Pose.
+        Голову (14/15) и клюв/крен (16/17) эта функция сознательно не трогает —
+        головой рулит исключительно трекинг лица (face offset) в robot_brain.py,
+        а прежняя запись позиции носа в angles[16]/angles[17] была ошибкой:
+        по прошивке это HEAD_ROLL_INDEX/BEAK_INDEX, а не что-либо связанное
+        с носом или с трекингом лица."""
         if self.last_pose_landmarks is None:
             return [90] * 18
 
@@ -502,11 +417,6 @@ class VisionEngine:
             right_elbow = self.last_pose_landmarks[14]
             angles[2] = int(left_elbow["y"] * 180)
             angles[3] = int(right_elbow["y"] * 180)
-
-            nose = self.last_pose_landmarks[0]
-            angles[16] = int(nose["x"] * 180)
-            angles[17] = int(nose["y"] * 180)
-
         except (IndexError, KeyError):
             pass
 
@@ -516,10 +426,5 @@ class VisionEngine:
         if self.pose:
             try:
                 self.pose.close()
-            except Exception:
-                pass
-        if self.face_mesh:
-            try:
-                self.face_mesh.close()
             except Exception:
                 pass

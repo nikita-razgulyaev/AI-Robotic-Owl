@@ -120,27 +120,37 @@ CLOUD_MODEL_NAME = CLOUD_MODEL_NAME or ""
 LLM_LOCAL_MODELS = _config.get("llm", {}).get("local_models", [])
 LLM_CLOUD_MODELS = _config.get("llm", {}).get("cloud_models", [])
 
+QUICK_ANSWERS_ENABLED = bool(_config.get("quick_answers", {}).get("enabled", True))
+
+BACKLIGHT_AUTO_DEFAULT = bool(_config.get("backlight", {}).get("enabled", False))
+BACKLIGHT_MANUAL_DEFAULT = bool(_config.get("backlight", {}).get("manual_state", False))
+BACKLIGHT_LATITUDE = float(_config.get("backlight", {}).get("latitude", 59.2239))
+BACKLIGHT_LONGITUDE = float(_config.get("backlight", {}).get("longitude", 39.8845))
+BACKLIGHT_TIMEZONE = _config.get("backlight", {}).get("timezone", "Europe/Moscow")
+BACKLIGHT_CHECK_INTERVAL_SEC = int(_config.get("backlight", {}).get("check_interval_sec", 60))
+
 # Vision
 YOLO_MODEL = MODELS_DIR / "yolov8n.pt"
 ENABLE_POSE_TRACKING = _config.get("vision", {}).get("pose_tracking", True)
 
 # === Слежение за лицом (OpenCV) ===
-# Робот поворачивает "голову" (серво pan/tilt) к лицу собеседника ТОЛЬКО пока
-# активен диалог. Вне диалога камера продолжает работать (для панели
-# мониторинга), но серво головы не дёргаются.
+# Робот поворачивает "голову" (серво pan/tilt — HEAD_YAW=14/HEAD_PITCH=15 из
+# esp32_ai_robot_server.ino) к лицу собеседника ТОЛЬКО пока активен диалог.
+# Вне диалога камера продолжает работать (для панели мониторинга), но серво
+# головы не дёргаются.
 FACE_TRACKING_ENABLED = _config.get("vision", {}).get("face_tracking", True)
 DIALOG_ACTIVE_TIMEOUT_SEC = float(_config.get("vision", {}).get("dialog_active_timeout_sec", 20))
 # "Предварительное" окно — продлевается уже на VAD speech_start/speech, ДО распознавания.
 # Даёт голове сразу начать реагировать, но быстро отпускает, если ничего не подтвердилось
 # (шум/кашель). Настоящий диалог держится через DIALOG_ACTIVE_TIMEOUT_SEC (см. is_dialog_active).
 PROVISIONAL_DIALOG_TIMEOUT_SEC = float(_config.get("vision", {}).get("provisional_dialog_timeout_sec", 4))
-FACE_PAN_SERVO = int(_config.get("vision", {}).get("face_pan_servo", 16))
-FACE_TILT_SERVO = int(_config.get("vision", {}).get("face_tilt_servo", 17))
+FACE_PAN_SERVO = int(_config.get("vision", {}).get("face_pan_servo", 14))
+FACE_TILT_SERVO = int(_config.get("vision", {}).get("face_tilt_servo", 15))
 FACE_PAN_GAIN = float(_config.get("vision", {}).get("face_pan_gain", 45))
 FACE_TILT_GAIN = float(_config.get("vision", {}).get("face_tilt_gain", 30))
 
 # --- Сглаживание движения головы + "мёртвая зона" (имитация поля зрения) ---
-HEAD_SMOOTHING_ALPHA = float(_config.get("vision", {}).get("head_smoothing_alpha", 0.3))
+HEAD_SMOOTHING_ALPHA = float(_config.get("vision", {}).get("head_smoothing_alpha", 0.22))
 FACE_DEADZONE_X = float(_config.get("vision", {}).get("face_deadzone_x", 0.12))
 FACE_DEADZONE_Y = float(_config.get("vision", {}).get("face_deadzone_y", 0.12))
 
@@ -162,15 +172,14 @@ FACE_CASCADE_MIN_SIZE = int(_config.get("vision", {}).get("face_cascade_min_size
 FACE_TRACKER_MAX_DISTANCE = int(_config.get("vision", {}).get("face_tracker_max_distance", 90))
 FACE_TRACKER_MAX_MISSED_FRAMES = int(_config.get("vision", {}).get("face_tracker_max_missed_frames", 12))
 
-# --- Выбор говорящего по движению губ ---
-LIP_ACTIVITY_WINDOW_SEC = float(_config.get("vision", {}).get("lip_activity_window_sec", 0.8))
-MIN_LIP_SAMPLES_FOR_DECISION = int(_config.get("vision", {}).get("min_lip_samples_for_decision", 3))
-
 # --- Троттлинг тяжёлых детекторов (YOLO/Pose не нужно гонять на каждый кадр) ---
-# Детекция лица + трекер + активность губ НЕ троттлятся — от их частоты напрямую
-# зависит плавность слежения (сглаживание) и скорость выбора говорящего по губам.
+# Детекция лица + трекер НЕ троттлятся — от их частоты напрямую зависит
+# плавность слежения (сглаживание). Pose больше не двигает сервы (крылья
+# зеркалились от позы тела — убрано), нужен только для текстового описания
+# "вижу позу человека" в промпте — можно гонять редко, освобождая CV-поток
+# под более частую детекцию лица.
 YOLO_DETECTION_INTERVAL_SEC = float(_config.get("vision", {}).get("yolo_detection_interval_sec", 1.0))
-POSE_DETECTION_INTERVAL_SEC = float(_config.get("vision", {}).get("pose_detection_interval_sec", 0.2))
+POSE_DETECTION_INTERVAL_SEC = float(_config.get("vision", {}).get("pose_detection_interval_sec", 1.0))
 
 # === Видео в панели мониторинга ===
 VIDEO_PANEL_MIN_INTERVAL_SEC = float(_config.get("vision", {}).get("panel_frame_interval_sec", 0.15))
@@ -180,7 +189,9 @@ VIDEO_PANEL_JPEG_QUALITY = int(_config.get("vision", {}).get("panel_jpeg_quality
 # Интерполяция углов уже сглаживается на самой прошивке (interpolateServos), поэтому
 # слать новую цель на КАЖДЫЙ видеокадр избыточно — троттлим отправку по сети,
 # сам расчёт (детекция/трекинг/сглаживание) при этом остаётся на полной частоте.
-SERVO_UPDATE_MIN_INTERVAL_SEC = float(_config.get("vision", {}).get("servo_update_min_interval_sec", 0.1))
+# 0.065с ≈ 15 Гц — под пару с CAM_FPS_FACE=15 в прошивке; раньше 0.1с (10 Гц)
+# заново занижало эффективный FPS слежения ниже того, что реально шлёт камера.
+SERVO_UPDATE_MIN_INTERVAL_SEC = float(_config.get("vision", {}).get("servo_update_min_interval_sec", 0.065))
 
 # Audio
 SAMPLE_RATE = int(_config.get("audio", {}).get("sample_rate", 16000))
