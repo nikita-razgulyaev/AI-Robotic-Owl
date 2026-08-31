@@ -15,3 +15,13 @@ audio_cache/
 
 # === Auth ===
 config/.session_secret
+
+# === Runtime data (генерируется сервером, не коммитим) ===
+qdrant_storage/
+memory/
+
+# === Сторонние бинарники (скачиваются/собираются отдельно) ===
+llama-bin/
+
+# === IDE (личные настройки) ===
+.vscode/

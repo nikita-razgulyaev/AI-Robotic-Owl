@@ -783,7 +783,7 @@ async def _maybe_broadcast_panel_frame():
 async def handle_binary_message(websocket: WebSocket, data: bytes):
     try:
         # Только ESP32 шлёт бинарные AUDI/VIDE/VIDP пакеты — переклассифицируем соединение
-        # (запасной вариант; основная идентификация теперь по "ping", см. handle_text_message)
+        # (запасной вариант; основная идентификация по "ping", см. handle_text_message)
         if websocket not in device_connections:
             device_connections.add(websocket)
             panel_connections.discard(websocket)

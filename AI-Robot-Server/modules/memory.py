@@ -373,12 +373,12 @@ class MemoryManager:
 
     def record_interaction(self, user_text: str, soren_text: str, emotion: str):
         """Записывает взаимодействие в системы памяти — каждый уровень (stm/ltm/profile)
-        независимо проверяется через memory_flags, вместо единого FAST_MODE как раньше"""
+        независимо проверяется через memory_flags"""
         flags = memory_flags.get_flags()
 
         # Краткосрочная — RAM only, нужна для связности диалога в пределах текущей
         # сессии, никакой записи на диск/в БД. Единственный уровень, включённый
-        # по умолчанию даже в fast_mode — но теперь тоже переключаем через панель.
+        # по умолчанию даже в fast_mode, но тоже переключаемый через панель.
         if flags.get("stm", True):
             self.short_term.add_turn("user", user_text)
             self.short_term.add_turn("assistant", soren_text, emotion)

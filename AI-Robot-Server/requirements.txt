@@ -1,4 +1,4 @@
-# === Robot AI Server - Requirements v3.5 (с памятью и fine-tuning) ===
+# === Robot AI Server - Requirements (с памятью и fine-tuning) ===
 # Python 3.10 - 3.11 рекомендуется
 
 # WebSocket сервер

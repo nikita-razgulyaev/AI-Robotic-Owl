@@ -47,8 +47,8 @@ def verify_session_token(token: Optional[str]) -> bool:
 
 def is_valid_device_ping(text: str, device_key: str) -> bool:
     """Проверяет, что первое сообщение — легитимный ping от ESP32.
-    Если device_key не настроен (пусто) — доверяем любому ping (как раньше,
-    обратная совместимость со старой прошивкой без DEVICE_KEY)."""
+    Если device_key не настроен (пусто) — доверяем любому ping
+    (обратная совместимость со старой прошивкой без DEVICE_KEY)."""
     try:
         data = json.loads(text)
     except (json.JSONDecodeError, TypeError):

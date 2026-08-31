@@ -41,8 +41,7 @@ async def test_text_command():
             ]
 
             for msg in test_messages:
-                print(f"
-   👤 Я: {msg}")
+                print(f"\n   👤 Я: {msg}")
                 await ws.send(json.dumps({"type": "text", "text": msg}))
                 response = await ws.recv()
                 data = json.loads(response)
@@ -52,14 +51,12 @@ async def test_text_command():
                 await asyncio.sleep(1)
 
             # 4. Очистка истории
-            print("
-4. Очистка истории...")
+            print("\n4. Очистка истории...")
             await ws.send(json.dumps({"type": "clear_history"}))
             response = await ws.recv()
             print(f"   {json.loads(response).get('message')}")
 
-            print("
-✅ Все тесты пройдены!")
+            print("\n✅ Все тесты пройдены!")
 
     except ConnectionRefusedError:
         print("❌ Не удалось подключиться. Запусти сервер: python websocket_server.py")
