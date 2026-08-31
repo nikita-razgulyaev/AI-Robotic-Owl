@@ -10,6 +10,8 @@ jobs:
         steps:
             - name: Checkout
               uses: actions/checkout@v4
+              with:
+                  fetch-depth: 2
 
             - name: Get commit message
               id: commit
@@ -19,6 +21,8 @@ jobs:
                   echo "Commit message: $MSG"
 
             - name: Trigger sync in public repo
+              env:
+                  MSG: ${{ steps.commit.outputs.message }}
               run: |
                   curl -X POST \
                     -H "Accept: application/vnd.github+json" \
@@ -28,7 +32,7 @@ jobs:
                     -d "{
                       \"event_type\":\"sync-trigger\",
                       \"client_payload\":{
-                        \"source\":\"${{ github.event.repository.name }}\",
-                        \"commit_message\":\"${{ steps.commit.outputs.message }}\"
+                        \"source\":\"3d-model-for-owl\",
+                        \"commit_message\":\"$MSG\"
                       }
                     }"
