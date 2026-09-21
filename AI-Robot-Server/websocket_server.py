@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from modules.robot_brain import RobotBrain
 from modules.wake_word import strip_wake_word
+from modules.animation_loader import animation_book
 from modules.auth import create_session_token, verify_session_token, is_valid_device_ping
 from modules import backlight_state
 from modules.backlight import is_night
@@ -64,6 +65,16 @@ _last_servo_send: Dict[WebSocket, Tuple[float, Optional[List[int]]]] = {}
 # по умолчанию True для новых подключений, пока панель явно не скажет иначе.
 panel_wants_video: Dict[WebSocket, bool] = {}
 
+# ===== ОБРАТНАЯ СВЯЗЬ ОТ ПЛАТЫ (device_state) =====
+# Когда соединение только что распознано как устройство (ESP32), ждём от него
+# {"type":"device_state", ...} с реальными углами серв/состоянием подсветки —
+# см. _handle_new_device_connection(). Событие в этом словаре "будится"
+# обработчиком device_state (см. handle_text_message), либо срабатывает
+# таймаут DEVICE_STATE_REPLY_TIMEOUT_SEC (совместимость со старой прошивкой,
+# которая device_state ещё не шлёт).
+_state_report_events: Dict[WebSocket, asyncio.Event] = {}
+DEVICE_STATE_REPLY_TIMEOUT_SEC = 1.5
+
 # ===== РАЗДЕЛЬНЫЕ РЕЖИМЫ АУДИО =====
 audio_input_mode = "robot"   # "robot" = ESP32 микрофон, "local" = микрофон ноутбука
 audio_output_mode = "robot"  # "robot" = ESP32 динамик, "local" = наушники ноутбука
@@ -75,10 +86,12 @@ async def startup():
     global robot_brain
     logger.info("🦉 Запуск сервера Сорена...")
     robot_brain = RobotBrain()
-    robot_brain.on_servo_frame = broadcast_servo_angles_to_devices
+    robot_brain.on_servo_frame = broadcast_servo_state
     # Fallback: подключаем напрямую к ServoController, чтобы ручное управление
-    # из панели (servo / servo_multi) тоже уходило на ESP32
-    robot_brain.servos.on_servo_frame = broadcast_servo_angles_to_devices
+    # из панели (servo / servo_multi), анимации и плавный возврат в дефолт
+    # уходили и на ESP32, и в панель (см. broadcast_servo_state)
+    robot_brain.servos.on_servo_frame = broadcast_servo_state
+    robot_brain.start_background_tasks()
     asyncio.create_task(_backlight_loop())
     logger.info(f"✅ Сервер готов: ws://{SERVER_HOST}:{SERVER_PORT}")
 
@@ -112,6 +125,7 @@ async def status():
         "memory_flags": robot_brain.get_memory_flags(),
         "model_config": robot_brain.get_model_config(),
         "quick_answers": robot_brain.get_quick_answers_status(),
+        "animations": animation_book.list_info(),
         "backlight": {**backlight_state.get_state(), "effective": compute_effective_backlight_state()},
         "connections": len(active_connections),
         "panel_connections": len(panel_connections),
@@ -273,6 +287,18 @@ async def reload_quick_answers():
 
     result = await robot_brain.handle_command({"type": "reload_quick_answers"})
     logger.info(f"⚡ Словарь быстрых ответов перезагружен: {result.get('quick_answers')}")
+
+    return JSONResponse(result)
+
+@app.post("/animations/reload")
+async def reload_animations():
+    """Перечитывает character/animations/*.json с диска — без рестарта сервера.
+    Используется после добавления/правки файла с пользовательской анимацией."""
+    if robot_brain is None:
+        return JSONResponse({"status": "error", "message": "Сервер ещё загружается"})
+
+    result = await robot_brain.handle_command({"type": "reload_animations"})
+    logger.info(f"🎬 Анимации перезагружены: {result.get('count')}")
 
     return JSONResponse(result)
 
@@ -506,6 +532,7 @@ async def websocket_endpoint(websocket: WebSocket):
             return
 
         device_connections.add(websocket)
+        asyncio.create_task(_handle_new_device_connection(websocket))
 
     active_connections.add(websocket)
     if websocket not in device_connections:
@@ -532,11 +559,17 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"Ошибка WebSocket: {e}")
     finally:
+        was_device = websocket in device_connections
         active_connections.discard(websocket)
         panel_connections.discard(websocket)
         device_connections.discard(websocket)
         _last_servo_send.pop(websocket, None)
         panel_wants_video.pop(websocket, None)
+        _state_report_events.pop(websocket, None)
+        if was_device:
+            # Плата отключилась (например, перезагружается) — сразу говорим
+            # панели "Offline", не дожидаясь, пока кто-то вручную обновит страницу.
+            await notify_panels_status_changed()
 
 
 async def send_audio_to_device(websocket: WebSocket, audio_bytes: bytes, chunk_size: int = 4096):
@@ -614,6 +647,109 @@ async def broadcast_servo_angles_to_devices(angles: List[int]):
     for conn in dead:
         device_connections.discard(conn)
         active_connections.discard(conn)
+
+
+async def broadcast_servo_state(angles: List[int]):
+    """Рассылает кадр углов И устройству (как команду servo_update — реально
+    двигает сервы), И панелям (как информационное servo_state — просто
+    обновляет слайдеры в UI). Раньше панель НЕ получала кадры анимации/плавного
+    возврата в дефолт вообще, потому что on_servo_frame был подключён напрямую
+    к broadcast_servo_angles_to_devices, которая шлёт только в device_connections —
+    после проигрывания анимации из панели её собственные слайдеры оставались
+    в положении "до" анимации, пока не придёт следующий ручной fetchStatus()."""
+    await broadcast_servo_angles_to_devices(angles)
+    if not panel_connections:
+        return
+    panel_cmd = {"type": "servo_state", "angles": angles}
+    dead = []
+    for conn in list(panel_connections):
+        try:
+            await conn.send_json(panel_cmd)
+        except Exception:
+            dead.append(conn)
+    for conn in dead:
+        panel_connections.discard(conn)
+        active_connections.discard(conn)
+
+
+async def _glide_all_servos_to_default():
+    """Плавно возвращает все сервы в позу по умолчанию, рассылая кадры и
+    устройству, и панели (см. broadcast_servo_state)."""
+    if robot_brain is None:
+        return
+    await robot_brain.servos.smooth_return_to_default(on_frame=broadcast_servo_state)
+
+
+async def notify_panels_status_changed():
+    """Сообщает всем открытым панелям мониторинга "у устройства что-то
+    изменилось — перезапроси /status" — так же, как панель сама делает при
+    открытии (см. fetchStatus() в JS). Проще и надёжнее, чем дублировать в двух
+    местах логику "что именно положить в апдейт" — /status и так уже отдаёт
+    servo_angles, backlight, device_connections и т.д. одним снимком."""
+    if not panel_connections:
+        return
+    cmd = {"type": "device_status_changed"}
+    dead = []
+    for conn in list(panel_connections):
+        try:
+            await conn.send_json(cmd)
+        except Exception:
+            dead.append(conn)
+    for conn in dead:
+        panel_connections.discard(conn)
+        active_connections.discard(conn)
+
+
+async def _handle_new_device_connection(websocket: WebSocket):
+    """Запускается ОДИН раз при первом подтверждении, что соединение — плата
+    (ESP32), а не панель мониторинга (см. места вызова в handle_text_message /
+    handle_binary_message / websocket_endpoint — везде под guard "если ещё не
+    было в device_connections", чтобы не перезапускать этот сценарий на каждый
+    ping/кадр).
+
+    Логика (обратная связь платы → сервер, чтобы после перезапуска сервера ИЛИ
+    платы значения серв/подсветки на панели снова были актуальными, а не
+    "залипшими" в дефолте/старом состоянии):
+      1. Просим плату прислать её РЕАЛЬНОЕ текущее состояние (request_state).
+      2. Ждём device_state максимум DEVICE_STATE_REPLY_TIMEOUT_SEC — если
+         прошивка ещё не обновлена и его не шлёт, работаем от последнего
+         известного серверу состояния (не блокируем подключение).
+      3. Плавно возвращаем сервы в позу по умолчанию (90°) — от какой бы то ни
+         было стартовой точки, известной на шаге 1-2.
+      4. Принудительно досылаем актуальное состояние подсветки (server —
+         источник истины для авто/ручного режима, но плата могла быть выключена
+         дольше BACKLIGHT_CHECK_INTERVAL_SEC и пропустить последнюю смену).
+      5. Сообщаем панелям, что состояние устройства изменилось
+         (notify_panels_status_changed) — дважды: сразу (чтобы индикатор
+         "Online" не ждал секунды-полторы) и в конце (когда сервы/подсветка
+         уже реально приведены в актуальное состояние)."""
+    await notify_panels_status_changed()
+
+    event = asyncio.Event()
+    _state_report_events[websocket] = event
+    try:
+        await websocket.send_json({"type": "request_state"})
+    except Exception:
+        pass
+
+    try:
+        await asyncio.wait_for(event.wait(), timeout=DEVICE_STATE_REPLY_TIMEOUT_SEC)
+        logger.info("📥 Плата прислала своё реальное состояние (device_state)")
+    except asyncio.TimeoutError:
+        logger.info(
+            f"📥 Плата не ответила device_state за {DEVICE_STATE_REPLY_TIMEOUT_SEC}с "
+            "(старая прошивка?) — возвращаю сервы в дефолт от последнего известного "
+            "серверу состояния"
+        )
+    finally:
+        _state_report_events.pop(websocket, None)
+
+    if websocket not in device_connections:
+        return  # устройство уже отключилось, пока мы ждали ответа
+
+    await _glide_all_servos_to_default()
+    await refresh_backlight(force=True)
+    await notify_panels_status_changed()
 
 
 def compute_effective_backlight_state() -> bool:
@@ -695,22 +831,26 @@ async def handle_text_message(websocket: WebSocket, text: str):
         data = json.loads(text)
         msg_type = data.get("type")
 
-        if msg_type in ["servo", "servo_multi", "animation", "text", "get_status", "clear_history", "set_mode"]:
+        if msg_type in ["servo", "servo_multi", "animation", "text", "get_status", "clear_history", "set_mode",
+                        "list_animations", "reload_animations"]:
             result = await robot_brain.handle_command(data)
             await websocket.send_json(result)
             # Гарантированная отправка на ESP32 после ручного управления сервами из панели
-            if msg_type in ("servo", "servo_multi") and device_connections:
+            if msg_type in ("servo", "servo_multi"):
                 angles = robot_brain.servos.get_current_angles()
-                logger.info(f"📡 [TX servo] manual {msg_type} trigger → broadcasting to {len(device_connections)} device(s)")
-                await broadcast_servo_angles_to_devices(angles)
+                logger.info(f"📡 [TX servo] manual {msg_type} trigger → broadcasting angles: {angles}")
+                await broadcast_servo_state(angles)
         elif msg_type == "ping":
             # ESP32 шлёт "ping" первым сообщением сразу после коннекта (см. .ino,
             # WStype_CONNECTED) — панель мониторинга такое никогда не шлёт. Это уже
             # существующий надёжный маркер устройства, используем его для явной
             # идентификации, не дожидаясь первого бинарного AUDI/VIDE-пакета.
+            is_new_device = websocket not in device_connections
             device_connections.add(websocket)
             panel_connections.discard(websocket)
             await websocket.send_json({"type": "pong", "timestamp": data.get("timestamp")})
+            if is_new_device:
+                asyncio.create_task(_handle_new_device_connection(websocket))
         elif msg_type == "hello":
             # Явная самоидентификация клиента (например, панель шлёт {type:'hello', client:'panel'}
             # при подключении) — на случай, если в будущем логика "по умолчанию — панель"
@@ -720,9 +860,43 @@ async def handle_text_message(websocket: WebSocket, text: str):
                 panel_connections.add(websocket)
                 device_connections.discard(websocket)
             elif client == "esp32":
+                is_new_device = websocket not in device_connections
                 device_connections.add(websocket)
                 panel_connections.discard(websocket)
+                if is_new_device:
+                    asyncio.create_task(_handle_new_device_connection(websocket))
             await websocket.send_json({"type": "hello_ack", "client": client})
+        elif msg_type == "device_state":
+            # Обратная связь от платы: её РЕАЛЬНОЕ текущее состояние (серво +
+            # подсветка), присылается в ответ на request_state (см.
+            # _handle_new_device_connection) — а также, если прошивка захочет,
+            # проактивно в любой момент (например, если состояние поменялось
+            # локально на плате — кнопкой на корпусе и т.п.).
+            # Ожидаемый формат: {"type":"device_state",
+            #                     "angles": {"0":90, "1":87, ...} | [90,87,...],
+            #                     "backlight": true|false}
+            raw_angles = data.get("angles")
+            if raw_angles:
+                angles_list = robot_brain.servos.get_current_angles()
+                if isinstance(raw_angles, dict):
+                    for key, value in raw_angles.items():
+                        try:
+                            idx = int(key)
+                        except (TypeError, ValueError):
+                            continue
+                        if 0 <= idx < 18:
+                            angles_list[idx] = int(value)
+                elif isinstance(raw_angles, list) and len(raw_angles) == 18:
+                    angles_list = [int(a) for a in raw_angles]
+                robot_brain.servos.apply_device_state(angles_list)
+
+            raw_backlight = data.get("backlight")
+            if raw_backlight is not None:
+                logger.info(f"📥 [RX device_state] подсветка на плате сейчас: {bool(raw_backlight)}")
+
+            event = _state_report_events.get(websocket)
+            if event is not None:
+                event.set()
         elif msg_type == "video_pref":
             # Панель сообщает, хочет ли она получать видео (чекбокс "Показывать видео").
             # Не влияет на детекцию/трекинг — только на то, кому реально рассылается кадр.
@@ -787,6 +961,7 @@ async def handle_binary_message(websocket: WebSocket, data: bytes):
         if websocket not in device_connections:
             device_connections.add(websocket)
             panel_connections.discard(websocket)
+            asyncio.create_task(_handle_new_device_connection(websocket))
 
         if len(data) < 5:
             return
@@ -862,7 +1037,11 @@ async def _send_servo_update(websocket: WebSocket, vision_result: dict):
         "face_offset": vision_result["face_offset"],
         "dialog_active": vision_result.get("dialog_active", False)
     }
-    logger.info(f"📡 [TX servo] delta to {websocket.client.host}:{websocket.client.port}: {delta}")
+    logger.info(
+        f"📡 [TX servo] delta to {websocket.client.host}:{websocket.client.port}: "
+        f"{delta} | offset_x={vision_result['face_offset'][0]:.2f} "
+        f"offset_y={vision_result['face_offset'][1]:.2f}"
+    )
     await websocket.send_json(servo_cmd)
     _last_servo_send[websocket] = (now, list(servo_angles))
 
@@ -1691,6 +1870,15 @@ PANEL_HTML = """
             </div>
 
             <div class="tab-pane" data-pane="servos">
+              <div class="mini-card row-between" style="margin-bottom:12px; gap:8px;">
+                <select class="select-line" id="animationSelect" onchange="updateAnimationHint()"></select>
+                <button class="chip-btn" onclick="playSelectedAnimation()" title="Запустить выбранную анимацию">▶ Запустить</button>
+                <button class="chip-btn" onclick="reloadAnimations()" title="Перечитать character/animations/*.json">⟳ Обновить</button>
+              </div>
+              <p class="hint-text" id="animationHint">—</p>
+              <p class="hint-text">
+                Анимации хранятся в <code>character/animations/</code>
+              </p>
               <div class="servo-grid" id="servoGrid"></div>
             </div>
 
@@ -1877,6 +2065,7 @@ PANEL_HTML = """
   let memoryFlags = { stm: true, ltm: true, profile: true, rag: true };
   let modelConfig = { llm: {mode:'local', current:null, local_models:[], cloud_models:[]}, stt: {current:null, models:[]}, tts: {mode:'local', current:null, speakers:[]} };
   let quickAnswersStatus = { enabled: true, count: 0 };
+  let animationsList = [];
   let backlightState = { auto: false, manual: false, effective: false };
 
   // "Connection open/closed" — собственный WS-канал этой панели.
@@ -1900,6 +2089,7 @@ PANEL_HTML = """
     ws.send(JSON.stringify({type:'audio_mode'}));
     ws.send(JSON.stringify({type:'ai_mode'}));
     ws.send(JSON.stringify({type:'video_pref', enabled: videoPrefEnabled}));
+    ws.send(JSON.stringify({type:'list_animations'}));
     fetchStatus();
   };
   ws.onclose = () => {
@@ -1914,6 +2104,13 @@ PANEL_HTML = """
       return; // не спамим журнал каждым кадром
     }
     log('← ' + JSON.stringify(data));
+    if (data.type === 'device_status_changed') {
+      // Плата (пере)подключилась или отключилась (например, перезагрузка робота) —
+      // сервер уже привёл сервы/подсветку в актуальное состояние на своей стороне,
+      // просто перечитываем /status тем же путём, что и при открытии панели.
+      fetchStatus();
+      return;
+    }
     if (data.angles) updateServoDisplay(data.angles);
     if (data.type === 'audio_mode') {
       if (data.input_mode) audioInputMode = data.input_mode;
@@ -1928,6 +2125,7 @@ PANEL_HTML = """
       if (data.ai_modes) { aiModes = data.ai_modes; updateAIModeUI(); }
     }
     if (data.modes && !data.type) { aiModes = data.modes; updateAIModeUI(); }
+    if (data.status === 'ok' && Array.isArray(data.animations)) { animationsList = data.animations; updateAnimationsUI(); }
     if (typeof data.dialog_active === 'boolean') updateDialogBadges(data.face_detected, data.dialog_active);
   };
 
@@ -1939,6 +2137,7 @@ PANEL_HTML = """
       if (data.memory_flags) { memoryFlags = data.memory_flags; updateMemoryFlagsUI(); }
       if (data.model_config) { modelConfig = data.model_config; updateModelSelectsUI(); }
       if (data.quick_answers) { quickAnswersStatus = data.quick_answers; updateQuickAnswersUI(); }
+      if (Array.isArray(data.animations)) { animationsList = data.animations; updateAnimationsUI(); }
       if (data.backlight) { backlightState = data.backlight; updateBacklightUI(); }
       if (data.ai_modes) { aiModes = data.ai_modes; updateAIModeUI(); }
       if (Array.isArray(data.servo_angles)) updateServoDisplay(data.servo_angles);
@@ -2273,6 +2472,48 @@ PANEL_HTML = """
     const txt = document.getElementById('qaCountText');
     if (!txt) return;
     txt.textContent = quickAnswersStatus.enabled ? `${quickAnswersStatus.count} записей` : 'выключено (config.yaml)';
+  }
+
+  // ==================== АНИМАЦИИ (встроенные + character/animations/*.json) ====================
+  function updateAnimationsUI(){
+    const sel = document.getElementById('animationSelect');
+    if (!sel) return;
+    const prevValue = sel.value;
+    sel.innerHTML = '';
+    animationsList.forEach(a => {
+      const opt = document.createElement('option');
+      opt.value = a.name;
+      opt.textContent = a.source === 'custom' ? `${a.name} (своя)` : a.name;
+      sel.appendChild(opt);
+    });
+    if (prevValue && animationsList.some(a => a.name === prevValue)) sel.value = prevValue;
+    updateAnimationHint();
+  }
+  function updateAnimationHint(){
+    const sel = document.getElementById('animationSelect');
+    const hint = document.getElementById('animationHint');
+    if (!sel || !hint) return;
+    const a = animationsList.find(x => x.name === sel.value);
+    if (!a) { hint.textContent = 'Нет доступных анимаций — добавь файл в character/animations/'; return; }
+    const src = a.source === 'custom' ? 'своя' : 'встроенная';
+    const desc = a.description ? ` — ${a.description}` : '';
+    hint.textContent = `${src}, ${a.frame_count} кадр(ов), ${Math.round(a.duration_ms)}мс${desc}`;
+  }
+  function playSelectedAnimation(){
+    const sel = document.getElementById('animationSelect');
+    if (!sel || !sel.value) return;
+    sendCmd({type:'animation', name: sel.value});
+  }
+  async function reloadAnimations(){
+    try {
+      const r = await fetch('/animations/reload', {method:'POST'});
+      const data = await r.json();
+      if (data.status === 'ok'){
+        animationsList = data.animations || [];
+        updateAnimationsUI();
+        log(`Анимации обновлены ✓ (${data.count})`);
+      } else log('Ошибка: ' + (data.message || 'неизвестная'));
+    } catch(e) { log('Сетевая ошибка: ' + e.message); }
   }
 
   // ==================== АУДИО-МАРШРУТИЗАЦИЯ ====================

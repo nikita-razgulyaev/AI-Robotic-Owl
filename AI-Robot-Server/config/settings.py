@@ -150,7 +150,7 @@ FACE_PAN_GAIN = float(_config.get("vision", {}).get("face_pan_gain", 45))
 FACE_TILT_GAIN = float(_config.get("vision", {}).get("face_tilt_gain", 30))
 
 # --- Сглаживание движения головы + "мёртвая зона" (имитация поля зрения) ---
-HEAD_SMOOTHING_ALPHA = float(_config.get("vision", {}).get("head_smoothing_alpha", 0.22))
+HEAD_SMOOTHING_ALPHA = float(_config.get("vision", {}).get("head_smoothing_alpha", 0.16))
 FACE_DEADZONE_X = float(_config.get("vision", {}).get("face_deadzone_x", 0.12))
 FACE_DEADZONE_Y = float(_config.get("vision", {}).get("face_deadzone_y", 0.12))
 
@@ -192,10 +192,17 @@ VIDEO_PANEL_JPEG_QUALITY = int(_config.get("vision", {}).get("panel_jpeg_quality
 SERVO_UPDATE_MIN_INTERVAL_SEC = float(_config.get("vision", {}).get("servo_update_min_interval_sec", 0.065))
 
 # Audio
-SAMPLE_RATE = int(_config.get("audio", {}).get("sample_rate", 16000))
-CHUNK_DURATION_MS = int(_config.get("audio", {}).get("chunk_duration_ms", 30))
-VAD_AGGRESSIVENESS = int(_config.get("audio", {}).get("vad_aggressiveness", 2))
-SILENCE_TIMEOUT_MS = int(_config.get("audio", {}).get("silence_timeout_ms", 1500))
+_AUDIO_CFG = _config.get("audio", {})
+SAMPLE_RATE = int(_AUDIO_CFG.get("sample_rate", 16000))
+CHUNK_DURATION_MS = int(_AUDIO_CFG.get("chunk_duration_ms", 30))
+VAD_AGGRESSIVENESS = int(_AUDIO_CFG.get("vad_aggressiveness", 2))
+SILENCE_TIMEOUT_MS = int(_AUDIO_CFG.get("silence_timeout_ms", 1500))
+
+# --- Доп. фильтр шума по громкости (RMS), независимый от webrtcvad (см. audio_buffer.py) ---
+_ENERGY_GATE_CFG = _AUDIO_CFG.get("energy_gate", {})
+VAD_ENERGY_GATE_ENABLED = bool(_ENERGY_GATE_CFG.get("enabled", True))
+VAD_ENERGY_MIN_RMS = float(_ENERGY_GATE_CFG.get("min_rms", 150))
+VAD_ENERGY_FLOOR_MULTIPLIER = float(_ENERGY_GATE_CFG.get("floor_multiplier", 2.5))
 
 # Servo config
 SERVO_CFG = _config.get("servos", {})
@@ -207,6 +214,16 @@ SERVO_CONFIG = {
     "min_angle": SERVO_CFG.get("min_angle", 0),
     "max_angle": SERVO_CFG.get("max_angle", 180),
 }
+
+# Через сколько секунд бездействия сервы сами возвращаются в позу "calm" (см.
+# RobotBrain._idle_watchdog_loop) — раньше ничего не возвращало их обратно, и
+# робот навсегда "застревал" в позе последнего распознанного действия/эмоции.
+IDLE_RETURN_TIMEOUT_SEC = float(SERVO_CFG.get("idle_return_timeout_sec", 6))
+
+# Папка с пользовательскими анимациями (JSON-файлы, по одной анимации на файл) —
+# см. modules/animation_loader.py. Создаётся автоматически, если её ещё нет.
+ANIMATIONS_DIR = CHARACTER_DIR / "animations"
+ANIMATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Анимации
 ANIMATIONS = {
@@ -269,3 +286,6 @@ SESSION_SECRET = _load_or_create_session_secret()
 SESSION_COOKIE_NAME = "soren_session"
 SESSION_SHORT_MAX_AGE_SEC = 12 * 3600            # без "запомнить это устройство" — 12 часов
 SESSION_REMEMBER_MAX_AGE_SEC = 90 * 24 * 3600    # с галочкой — 90 дней
+
+FACE_PAN_INVERT = False   # True = инвертировать пан (лево-право)
+FACE_TILT_INVERT = False   # True = инвертировать тилт (вверх-вниз)
