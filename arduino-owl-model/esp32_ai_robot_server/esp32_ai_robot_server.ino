@@ -1,6 +1,8 @@
 /* 🦉 Robot ESP32-S3 Firmware - Soren */
 
 #include <WiFi.h>
+#include <ETH.h>
+#include <SPI.h>
 #include <WebSocketsClient.h>
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
@@ -13,15 +15,61 @@
 // ==================== КОНФИГУРАЦИЯ ====================
 const char* WIFI_SSID = "TP-Link_208E";
 const char* WIFI_PASSWORD = "31267649";
-const char* SERVER_HOST = "192.168.1.108";
+const char* SERVER_HOST = "192.168.50.10";  // статический IP ПК на адаптере TP-LINK USB-Ethernet
 const char* DEVICE_KEY = "";
 const int SERVER_PORT = 8765;
+
+// ---------- ETHERNET (модуль W5500 по SPI) ----------
+// GPIO0/45/46 — strapping-пины ESP32-S3: их уровень чип читает В МОМЕНТ
+// СБРОСА, чтобы выбрать режим загрузки. Внешнее устройство на них (было тут
+// раньше — 0=MOSI, 46=CS) срывает это определение при каждом
+// авто-сбросе/заливке ("Wrong boot mode detected"). Поэтому SPI переехал на
+// GPIO19/20/43/44 — ни один из них не strapping и не PSRAM (33-37).
+//
+// ВАЖНО: GPIO43/44 по умолчанию — консольный UART на CP2102 ("UART"-порт).
+// Заняв их под Ethernet, Serial-вывод для отладки нужно смотреть через
+// ВТОРОЙ, нативный USB-порт платы ("USB"), и в Arduino IDE включить
+// Tools → USB CDC On Boot → Enabled — иначе Serial.print() будет уходить в
+// никуда.
+// ПЛАТА: ESP32-S3-DevKitC-1, модуль WROOM-1 -N16R8 (Octal PSRAM).
+// ЭКСПЕРИМЕНТ: пробуем вернуть SCK/MISO на strapping-пины 0/46, но НЕ в
+// тех же ролях, что раньше сорвали загрузку (было 0=MOSI, 46=CS).
+// Теория: SCK всегда ведёт ESP32 (мастер), W5500 (ведомый) его не тянет;
+// MISO — вход для ESP32, GPIO46 к тому же input-only. Раньше проблема
+// была именно с MOSI/CS на strapping-пинах — не факт, что SCK/MISO
+// поведут себя так же. ПРОВЕРИТЬ: после заливки следить за выводом
+// esptool — если снова "Wrong boot mode detected"/сбои автосброса на
+// каждой заливке, откатывать на 43/44 (см. предыдущую версию комментария
+// в истории правок).
+#define ETH_PHY_TYPE   ETH_PHY_W5500
+#define ETH_PHY_ADDR   1
+#define ETH_PHY_CS     20
+#define ETH_PHY_IRQ    -1
+#define ETH_PHY_RST    48
+#define ETH_SPI_SCK    0
+#define ETH_SPI_MISO   46
+#define ETH_SPI_MOSI   19
+
+#define ETH_CONNECT_TIMEOUT_MS 4000  // сколько ждём линк+DHCP на Ethernet при старте,
+                                      // прежде чем откатиться на Wi-Fi
+#define WIFI_FALLBACK_TIMEOUT_MS 20000
+
+bool ethConnected = false;      // Ethernet реально поднят и получил IP прямо сейчас
+bool wifiFallbackActive = false; // на этом старте работаем через Wi-Fi (Ethernet не найден/не подключен)
 
 // ---------- СЕРВОПРИВОДЫ ----------
 Adafruit_PWMServoDriver pca = Adafruit_PWMServoDriver(0x40);
 const int PCA_FREQ = 50;
 const int SERVO_17_PIN = 38;
 const int SERVO_18_PIN = 39;
+
+// ESP32-S3 аппаратно поддерживает МАКСИМУМ 14 бит разрешения на канал LEDC
+// (в отличие от классического ESP32, где было 20 бит). Раньше здесь стояло 16 —
+// ledcAttach() с недопустимым разрешением тихо возвращает false и канал вообще
+// не настраивается, поэтому ledcWrite() на GPIO 38/39 ничего не делал — именно
+// поэтому сервы HEAD_ROLL/BEAK "не работали".
+#define SERVO_GPIO_LEDC_RES_BITS 14
+#define SERVO_GPIO_LEDC_MAX_DUTY ((1 << SERVO_GPIO_LEDC_RES_BITS) - 1)  // 16383
 
 // -------------------- ИМЕНОВАННЫЕ ИНДЕКСЫ СЕРВО --------------------
 #define L_FLAP          0   // Левое крыло — взмах
@@ -45,7 +93,8 @@ const int SERVO_18_PIN = 39;
 
 #define PCA_SERVO_COUNT 16  // сколько первых индексов (0-15) идут через PCA9685
 
-#define SERVO_MAX_STEP 4
+#define SERVO_MAX_STEP 3        // потолок скорости (град/тик = 10мс) — верхний предел даже для больших скачков цели
+#define SERVO_EASE_FACTOR 0.12  // доля оставшегося расстояния до цели, проходимая за один тик (плавное подтормаживание к концу)
 #define SERVO_UPDATE_MS 10
 #define SERVO_DEAD_ZONE 1
 
@@ -149,6 +198,81 @@ unsigned long lastHeartbeatRecvMs = 0;
 #define MIC_DEAF_MS_AFTER_AUDIO 400
 static unsigned long lastSpkActiveMs = 0;
 
+// ==================== СЕТЬ (Ethernet первым, Wi-Fi — резерв) ====================
+void onNetworkEvent(arduino_event_id_t event, arduino_event_info_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_ETH_START:
+      Serial.println("[ETH] Интерфейс стартовал");
+      ETH.setHostname("soren-owl");
+      break;
+    case ARDUINO_EVENT_ETH_CONNECTED:
+      Serial.println("[ETH] Кабель на линке");
+      break;
+    case ARDUINO_EVENT_ETH_GOT_IP:
+      Serial.print("[ETH] ✅ IP получен: ");
+      Serial.println(ETH.localIP());
+      ethConnected = true;
+      break;
+    case ARDUINO_EVENT_ETH_LOST_IP:
+    case ARDUINO_EVENT_ETH_DISCONNECTED:
+    case ARDUINO_EVENT_ETH_STOP:
+      if (ethConnected) Serial.println("[ETH] Соединение потеряно");
+      ethConnected = false;
+      break;
+    default:
+      break;
+  }
+}
+
+// Пробует поднять Ethernet (модуль W5500); если за ETH_CONNECT_TIMEOUT_MS
+// линк/IP не появился (кабель не воткнут или модуль не распаян) — откатывается
+// на Wi-Fi, как раньше. Выбор делается один раз при старте.
+void connectNetwork() {
+  Network.onEvent(onNetworkEvent);
+
+  Serial.println("[NET] Пробую Ethernet (W5500)...");
+  SPI.begin(ETH_SPI_SCK, ETH_SPI_MISO, ETH_SPI_MOSI, ETH_PHY_CS);
+  ETH.begin(ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_CS, ETH_PHY_IRQ, ETH_PHY_RST, SPI);
+
+  // ETH.config() обязательно ПОСЛЕ ETH.begin() — до begin() сетевой
+  // интерфейс ещё не создан, вызов молча игнорируется (или роняет в
+  // панику на некоторых версиях core), и плата тихо продолжает ждать
+  // DHCP, как будто config() не было. Статика: прямое соединение
+  // ПК↔робот через USB-Ethernet переходник без DHCP-сервера.
+  IPAddress staticIP(192, 168, 50, 20);
+  IPAddress gateway(192, 168, 50, 10);
+  IPAddress subnet(255, 255, 255, 0);
+  ETH.config(staticIP, gateway, subnet);
+
+  unsigned long ethWaitStart = millis();
+  while (!ethConnected && millis() - ethWaitStart < ETH_CONNECT_TIMEOUT_MS) {
+    delay(100);
+  }
+
+  if (ethConnected) {
+    Serial.println("[NET] ✅ Работаем через Ethernet");
+    return;
+  }
+
+  Serial.println("[NET] Ethernet не поднялся (нет кабеля/модуля) — переключаюсь на Wi-Fi");
+  wifiFallbackActive = true;
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("[NET] Connecting to WiFi");
+  unsigned long wifiWaitStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiWaitStart < WIFI_FALLBACK_TIMEOUT_MS) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[NET] ✅ Работаем через Wi-Fi, IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("[NET] ⚠️ Wi-Fi тоже не подключился за таймаут — "
+                    "продолжаю пробовать в фоне (WiFi сам переподключается)");
+  }
+}
+
 // ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);
@@ -185,8 +309,10 @@ void setup() {
 
   pca.setPWMFreq(PCA_FREQ);
 
-  ledcAttach(SERVO_17_PIN, 50, 16);
-  ledcAttach(SERVO_18_PIN, 50, 16);
+  bool attach17 = ledcAttach(SERVO_17_PIN, 50, SERVO_GPIO_LEDC_RES_BITS);
+  bool attach18 = ledcAttach(SERVO_18_PIN, 50, SERVO_GPIO_LEDC_RES_BITS);
+  if (!attach17) Serial.println("❌ ledcAttach GPIO38 (HEAD_ROLL) FAILED");
+  if (!attach18) Serial.println("❌ ledcAttach GPIO39 (BEAK) FAILED");
 
   for (int i = 0; i < 18; i++) {
     currentServoAngles[i] = 90;
@@ -208,15 +334,7 @@ void setup() {
     }
   }
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.print("Connected! IP: ");
-  Serial.println(WiFi.localIP());
+  connectNetwork();
 
   webSocket.begin(SERVER_HOST, SERVER_PORT, "/ws");
   webSocket.onEvent(webSocketEvent);
@@ -237,6 +355,18 @@ bool isAudioPlaying() {
 // ==================== LOOP ====================
 void loop() {
   webSocket.loop();
+
+  // Если стартовали в резервном Wi-Fi-режиме, а Ethernet потом всё же
+  // появился (воткнули кабель) — просто перезагружаемся: чище, чем на лету
+  // тушить Wi-Fi и пересобирать сокеты, а плата и так переживает рестарт
+  // без потери состояния серв/подсветки (см. device_state на сервере).
+  static unsigned long lastEthRecheckMs = 0;
+  if (wifiFallbackActive && ethConnected && millis() - lastEthRecheckMs > 3000) {
+    lastEthRecheckMs = millis();
+    Serial.println("[NET] Ethernet появился во время работы на Wi-Fi — перезагружаюсь, чтобы переехать на него");
+    delay(200);
+    ESP.restart();
+  }
 
   if (isConnected) {
     // --- Микрофон: глушим во время TTS + 400 мс после, чтобы не поймать эхо ---
@@ -441,9 +571,29 @@ void handleServerCommand(String& json) {
     bool enabled = doc["enabled"] | false;
     setStandBacklight(enabled);
   }
+  else if (strcmp(cmdType, "request_state") == 0) {
+    // Сервер только что (пере)подключил нас и просит реальное состояние —
+    // серв и подсветки — чтобы не работать по сбитым/дефолтным данным после
+    // своего рестарта. Отвечаем тем, что физически выставлено ПРЯМО СЕЙЧАС.
+    sendDeviceState();
+  }
   else {
     Serial.printf("[WS] Unhandled type: %s\n", cmdType);
   }
+}
+
+void sendDeviceState() {
+  StaticJsonDocument<640> doc;
+  doc["type"] = "device_state";
+  JsonObject angles = doc.createNestedObject("angles");
+  for (int i = 0; i < 18; i++) {
+    angles[String(i)] = currentServoAngles[i];
+  }
+  doc["backlight"] = standBacklightOn;
+  String payload;
+  serializeJson(doc, payload);
+  webSocket.sendTXT(payload);
+  Serial.println("[TX device_state] реальное состояние (сервы + подсветка) отправлено на сервер");
 }
 
 // ==================== ПОДСВЕТКА ====================
@@ -493,6 +643,15 @@ void setStandBacklight(bool on) {
 }
 
 // ==================== СЕРВОПРИВОДЫ ====================
+// Duty для прямого GPIO-серво (500-2500мкс импульс @ 50Гц = 20000мкс период),
+// пересчитано под РЕАЛЬНОЕ разрешение SERVO_GPIO_LEDC_RES_BITS (14 бит на S3),
+// а не захардкоженные под несуществующие 16 бит числа, как раньше.
+int gpioServoDuty(int angle) {
+  const long minDuty = 500L  * (SERVO_GPIO_LEDC_MAX_DUTY + 1) / 20000L;  // ~410
+  const long maxDuty = 2500L * (SERVO_GPIO_LEDC_MAX_DUTY + 1) / 20000L;  // ~2048
+  return map(angle, 0, 180, (int)minDuty, (int)maxDuty);
+}
+
 void setServoAngle(int servoId, int angle) {
   angle = constrain(angle, 0, 180);
 
@@ -500,9 +659,9 @@ void setServoAngle(int servoId, int angle) {
     int pulse = map(angle, 0, 180, 150, 600);
     pca.setPWM(servoId, 0, pulse);
   } else if (servoId == HEAD_ROLL_INDEX) {
-    ledcWrite(SERVO_17_PIN, map(angle, 0, 180, 1638, 8192));  // GPIO 38, не "GPIO16"
+    ledcWrite(SERVO_17_PIN, gpioServoDuty(angle));  // GPIO 38, не "GPIO16"
   } else if (servoId == BEAK_INDEX) {
-    ledcWrite(SERVO_18_PIN, map(angle, 0, 180, 1638, 8192));  // GPIO 39, не "GPIO17"
+    ledcWrite(SERVO_18_PIN, gpioServoDuty(angle));  // GPIO 39, не "GPIO17"
   }
 
   currentServoAngles[servoId] = angle;
@@ -517,7 +676,16 @@ void interpolateServos() {
     int diff = targetServoAngles[i] - currentServoAngles[i];
     if (abs(diff) <= SERVO_DEAD_ZONE) continue;
 
-    int step = constrain(diff, -SERVO_MAX_STEP, SERVO_MAX_STEP);
+    // Eased-шаг: доля оставшегося расстояния, а не фиксированный шаг.
+    // Работает одинаково для мелких поправок слежения и для больших скачков цели
+    // (обрыв связи и реконнект, смена цели/лица, любой резкий "response" с сервера) —
+    // сервопривод никогда не дёргается на всю разницу за один тик: сначала едет с
+    // потолком скорости SERVO_MAX_STEP, затем плавно тормозит по мере приближения к цели.
+    float rawStep = diff * SERVO_EASE_FACTOR;
+    int step = (int)(rawStep + (rawStep > 0 ? 0.5f : -0.5f));  // округление к ближайшему, без доп. include
+    if (step == 0) step = (diff > 0) ? 1 : -1;  // гарантируем прогресс к цели даже на "хвосте"
+    step = constrain(step, -SERVO_MAX_STEP, SERVO_MAX_STEP);
+
     setServoAngle(i, currentServoAngles[i] + step);
     anyMoving = true;
   }
