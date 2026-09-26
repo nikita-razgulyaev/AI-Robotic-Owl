@@ -17,6 +17,7 @@ class ServoController:
         self.current_angles = [90] * 18
         self.target_angles = [90] * 18
         self.is_animating = False
+        self._active_task: Optional[asyncio.Task] = None
         self.hardware_available = False
         self.emotion_poses: Dict[str, List[int]] = {}
         # Объекты реального железа — создаются в enable_hardware(), используются
@@ -171,6 +172,71 @@ class ServoController:
 
         logger.info("Сервы плавно возвращены в позу по умолчанию (90°)")
 
+    async def _smooth_lead_in(self, target: List[int], on_frame: Optional[Callable], steps: int = 6, step_delay_s: float = 0.03):
+        """Пункт 2: короткая интерполяция (~180мс) от текущей позы к первому
+        кадру нового движения — сглаживает стык при смене владельца арбитра
+        (например idle -> environment), чтобы не было рывка "телепортом"
+        в первый кадр анимации/примитива."""
+        start = list(self.current_angles)
+        if start == target:
+            return
+        for step in range(1, steps + 1):
+            t = step / steps
+            angles = [int(round(start[i] + (target[i] - start[i]) * t)) for i in range(len(target))]
+            self.set_all_servos(angles, notify=False)
+            if on_frame:
+                await on_frame(angles)
+            await asyncio.sleep(step_delay_s)
+
+    async def play_frames(self, frames: List[Dict], on_frame: Optional[Callable[[List[int]], Awaitable[None]]] = None):
+        """Единый низкоуровневый стример кадров — сердце и play_animation(),
+        и motion_primitives.py (пункт 10 архитектуры: анимация и локомоция
+        не два разных пути, а один формат [{"time": ms, "servos": [18]}].
+
+        on_frame — см. play_animation(). Не проверяет self.is_animating сам —
+        это ответственность вызывающего (play_animation ставит флаг, чтобы
+        не пускать одновременно две анимации; motion_primitives использует
+        тот же флаг через тот же сеттер, см. play_motion())."""
+        if frames:
+            await self._smooth_lead_in(frames[0]["servos"], on_frame)
+
+        if frames:
+            await self._smooth_lead_in(frames[0]["servos"], on_frame)
+
+        self._active_task = asyncio.current_task()
+        try:
+            for i, keyframe in enumerate(frames):
+                self.set_all_servos(keyframe["servos"], notify=False)
+                if on_frame:
+                    await on_frame(keyframe["servos"])
+                if i < len(frames) - 1:
+                    next_time = frames[i + 1]["time"]
+                    current_time = keyframe["time"]
+                    await asyncio.sleep((next_time - current_time) / 1000)
+        finally:
+            if self._active_task is asyncio.current_task():
+                self._active_task = None
+
+    async def emergency_stop(self, on_frame: Optional[Callable[[List[int]], Awaitable[None]]] = None):
+        """Пункт 3 (SAFETY): немедленно отменяет текущую анимацию/примитив
+        (если есть) и переводит все сервы в нейтральную позу. Вызывать через
+        RobotBrain.emergency_stop() — там же бронируется Priority.SAFETY в
+        арбитре, здесь только физическая часть."""
+        task = self._active_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        neutral = [90] * 18
+        self.set_all_servos(neutral, notify=False)
+        if on_frame:
+            await on_frame(neutral)
+        self.is_animating = False
+        logger.warning("🛑 emergency_stop: текущее движение отменено, сервы в нейтральной позе")
+
     async def play_animation(self, animation_name: str, on_frame: Optional[Callable[[List[int]], Awaitable[None]]] = None):
         """Воспроизводит анимацию.
 
@@ -198,16 +264,28 @@ class ServoController:
         effective_on_frame = on_frame or self.on_servo_frame
 
         try:
-            for i, keyframe in enumerate(animation):
-                self.set_all_servos(keyframe["servos"], notify=False)
-                if effective_on_frame:
-                    await effective_on_frame(keyframe["servos"])
-                if i < len(animation) - 1:
-                    next_time = animation[i + 1]["time"]
-                    current_time = keyframe["time"]
-                    await asyncio.sleep((next_time - current_time) / 1000)
+            await self.play_frames(animation, on_frame=effective_on_frame)
         finally:
             self.is_animating = False
+
+    async def play_motion(self, frames: List[Dict], on_frame: Optional[Callable[[List[int]], Awaitable[None]]] = None) -> bool:
+        """То же самое, что play_animation(), но кадры приходят уже готовым
+        списком (из modules.motion_primitives), а не по имени из animation_book.
+        Использует тот же флаг is_animating — локомоция и анимация физически
+        не могут играть одновременно, ровно как и две анимации одновременно.
+        Возвращает False, если сервы были заняты и примитив не запустился."""
+        if self.is_animating:
+            logger.warning("Сервы заняты (анимация/другой примитив) — локомоция отклонена")
+            return False
+
+        self.is_animating = True
+        effective_on_frame = on_frame or self.on_servo_frame
+        try:
+            await self.play_frames(frames, on_frame=effective_on_frame)
+        finally:
+            self.is_animating = False
+        return True
+
 
     def interpolate_to_target(self, target: List[int], steps: int = 10, step_delay_ms: int = 50):
         """Плавно интерполирует текущие углы к целевым"""

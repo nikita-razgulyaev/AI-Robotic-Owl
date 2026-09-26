@@ -13,6 +13,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, F
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from modules.robot_brain import RobotBrain
+from modules.idle_thoughts import IdleThoughts
+from modules.micro_motion import MicroJitter
+from modules.gamepad_input import GamepadInput
 from modules.wake_word import strip_wake_word
 from modules.animation_loader import animation_book
 from modules.auth import create_session_token, verify_session_token, is_valid_device_ping
@@ -44,6 +47,9 @@ PANEL_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/panel-assets", StaticFiles(directory=str(PANEL_ASSETS_DIR)), name="panel-assets")
 
 robot_brain: RobotBrain = None
+idle_thoughts: IdleThoughts = None
+micro_jitter: MicroJitter = None
+gamepad_input: GamepadInput = None
 active_connections: Set[WebSocket] = set()
 
 # Разделяем подключения /ws на "устройство" (ESP32, шлёт бинарные AUDI/VIDE кадры)
@@ -93,10 +99,35 @@ async def startup():
     robot_brain.servos.on_servo_frame = broadcast_servo_state
     robot_brain.start_background_tasks()
     asyncio.create_task(_backlight_loop())
+
+    global idle_thoughts
+    idle_thoughts = IdleThoughts(
+        play_animation=robot_brain.servos.play_animation,
+        on_frame=broadcast_servo_state,
+    )
+    idle_thoughts.start()
+
+    global micro_jitter
+    micro_jitter = MicroJitter(
+        get_current_angles=robot_brain.servos.get_current_angles,
+        on_frame=broadcast_servo_state,
+    )
+    micro_jitter.start()
+
+    global gamepad_input
+    gamepad_input = GamepadInput(handle_command=dispatch_command_with_sfx)
+    gamepad_input.start()  # тихо не активируется, если геймпад/pygame не найдены
+
     logger.info(f"✅ Сервер готов: ws://{SERVER_HOST}:{SERVER_PORT}")
 
 @app.on_event("shutdown")
 async def shutdown():
+    if gamepad_input:
+        gamepad_input.stop()
+    if micro_jitter:
+        micro_jitter.stop()
+    if idle_thoughts:
+        idle_thoughts.stop()
     if robot_brain:
         robot_brain.shutdown()
     logger.info("Сервер остановлен")
@@ -277,6 +308,13 @@ async def set_backlight(mode: str = Form(...), enabled: str = Form(...)):
         "backlight": state,
         "effective": compute_effective_backlight_state()
     })
+
+@app.get("/arbiter/stats")
+async def get_arbiter_stats():
+    """Пункт 1: метрики арбитра — сколько раз каждый источник (safety/панель/
+    геймпад/environment/фон) реально перехватывал управление за последние 5 минут."""
+    from modules.arbiter import arbiter
+    return JSONResponse(arbiter.stats())
 
 @app.post("/quick_answers/reload")
 async def reload_quick_answers():
@@ -570,6 +608,13 @@ async def websocket_endpoint(websocket: WebSocket):
             # Плата отключилась (например, перезагружается) — сразу говорим
             # панели "Offline", не дожидаясь, пока кто-то вручную обновит страницу.
             await notify_panels_status_changed()
+            # Пункт 3 (SAFETY): если плата отвалилась посреди активной
+            # анимации/локомоции — серверное состояние is_animating иначе
+            # останется "залипшим" в True навсегда (отменить-то физически
+            # уже нечего, связи нет, но серверная модель должна знать, что
+            # текущее движение не завершилось штатно).
+            if robot_brain and robot_brain.servos.is_animating:
+                await robot_brain.emergency_stop(reason="device_disconnected")
 
 
 async def send_audio_to_device(websocket: WebSocket, audio_bytes: bytes, chunk_size: int = 4096):
@@ -826,14 +871,34 @@ async def broadcast_to_panels(message: dict, recipients: Optional[Set[WebSocket]
         panel_wants_video.pop(conn, None)
 
 
+async def dispatch_command_with_sfx(command: dict) -> dict:
+    """Единая обёртка над robot_brain.handle_command(): выполняет команду И
+    рассылает sfx/audio на устройство, если результат его содержит (см.
+    motion_primitives + quick_answers "motion_takeoff"/"motion_land").
+    Используется и панелью (через handle_text_message), и геймпадом
+    (модуль работает в Python напрямую, без WS-сообщения) — единая точка,
+    чтобы звук на локомоцию не зависел от того, кто именно её вызвал."""
+    result = await robot_brain.handle_command(command)
+
+    sfx_or_audio = result.get("sfx") or result.get("audio")
+    if sfx_or_audio:
+        pcm = robot_brain._load_cached_audio(sfx_or_audio)
+        if pcm:
+            for device_ws in list(device_connections):
+                asyncio.create_task(send_audio_to_device(device_ws, pcm))
+
+    return result
+
+
 async def handle_text_message(websocket: WebSocket, text: str):
     try:
         data = json.loads(text)
         msg_type = data.get("type")
 
         if msg_type in ["servo", "servo_multi", "animation", "text", "get_status", "clear_history", "set_mode",
-                        "list_animations", "reload_animations"]:
-            result = await robot_brain.handle_command(data)
+                        "list_animations", "reload_animations",
+                        "walk", "fly", "turn", "takeoff", "land", "emergency_stop"]:
+            result = await dispatch_command_with_sfx(data)
             await websocket.send_json(result)
             # Гарантированная отправка на ESP32 после ручного управления сервами из панели
             if msg_type in ("servo", "servo_multi"):

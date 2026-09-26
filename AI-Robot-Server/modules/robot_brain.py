@@ -3,6 +3,7 @@ import asyncio
 import logging
 import json
 import time
+import wave
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Dict, List, Callable, Awaitable
@@ -15,8 +16,11 @@ from modules.servo_controller import ServoController
 from modules.memory import MemoryManager
 from modules import memory_flags
 from modules.quick_answers import quick_answers
+from modules.semantic_quick_match import semantic_quick_match
 from modules.wake_word import strip_wake_word
 from modules.animation_loader import animation_book
+from modules.arbiter import arbiter, Priority
+from modules import motion_primitives
 from config.settings import (
     CHARACTER_DIR,
     FAST_MODE,
@@ -336,12 +340,24 @@ class RobotBrain:
     def set_tts_speaker(self, speaker: str):
         self.tts.set_speaker(speaker)
 
+    async def emergency_stop(self, reason: str = "unknown") -> Dict:
+        """Пункт 3: реальный путь SAFETY. Бронирует наивысший приоритет
+        арбитра (перебивает вообще всё, включая панель/геймпад) и переводит
+        сервы в нейтральную позу, отменяя всё, что сейчас играет.
+        reason — для логов/метрик (arbiter.stats() покажет, что и как часто
+        реально триггерило safety-остановку)."""
+        await arbiter.request(Priority.SAFETY, duration_s=3.0, label=f"safety:{reason}")
+        await self.servos.emergency_stop(on_frame=self.on_servo_frame)
+        logger.warning(f"🛑 Emergency stop: {reason}")
+        return {"status": "ok", "reason": reason}
+
     def get_quick_answers_status(self) -> Dict:
         return {"enabled": QUICK_ANSWERS_ENABLED, "count": quick_answers.count()}
 
     def reload_quick_answers(self) -> Dict:
         """Перечитывает character/quick_answers.json с диска — без рестарта сервера"""
         count = quick_answers.reload()
+        semantic_quick_match.build_index()  # триггеры могли измениться — пересобираем embedding-индекс
         return {"enabled": QUICK_ANSWERS_ENABLED, "count": count}
 
     async def process_audio_chunk(self, pcm_bytes: bytes) -> Optional[dict]:
@@ -369,6 +385,15 @@ class RobotBrain:
             # STT + LLM + TTS — тяжёлые синхронные вызовы (LLM может думать секундами) —
             # выполняем в отдельном потоке, чтобы не блокировать event loop целиком.
             result = await loop.run_in_executor(self._speech_executor, self._process_speech_sync, audio_bytes)
+
+            # Пункт 4: бронь арбитра на ENVIRONMENT при распознанном будильнике —
+            # _process_speech_sync выполняется в отдельном потоке и не может
+            # сама вызвать await arbiter.request(), поэтому только выставляет
+            # флаг self._wake_word_heard, а реальный await делаем здесь,
+            # обратно на event loop.
+            if getattr(self, "_wake_word_heard", False):
+                self._wake_word_heard = False
+                await arbiter.request(Priority.ENVIRONMENT, duration_s=1.0, label="wake_word")
 
             # asyncio.create_task требует запущенный event loop в текущем потоке,
             # поэтому анимацию запускаем здесь, а не внутри воркер-потока.
@@ -414,6 +439,10 @@ class RobotBrain:
                 return self._build_empty_response()
         else:
             logger.info(f"👂 Будильник распознан: '{user_text}' -> '{command_text or '(пусто)'}'")
+            # Пункт 4: сам факт "услышали своё имя" — environment-событие.
+            # Флаг вместо прямого await — см. пояснение в _process_speech()
+            # (эта функция синхронная, выполняется в отдельном потоке).
+            self._wake_word_heard = True
 
         logger.info(f"Пользователь: {command_text or '(только будильник, без команды)'}")
         self.mark_dialog_active()
@@ -436,7 +465,7 @@ class RobotBrain:
         eye_led = self.emotion_engine.get_eye_led(emotion)
 
         logger.info("Синтез речи...")
-        tts_audio = self.tts.synthesize(response_text)
+        tts_audio = self._synthesize_or_cached(response_text, llm_result.get("audio"))
 
         if tts_audio:
             self.last_tts_audio = tts_audio
@@ -473,6 +502,38 @@ class RobotBrain:
             "servo_changed": servo_changed,
         }
 
+    def _load_cached_audio(self, rel_path: Optional[str]) -> Optional[bytes]:
+        """Читает заранее сгенерированный WAV (character/<rel_path>, см.
+        scripts/build_audio_cache.py) и возвращает сырой PCM 16-bit mono
+        48kHz — тот же формат, что отдаёт self.tts.synthesize(). Модуль
+        wave сам отбрасывает заголовок WAV при чтении, поэтому конвертация
+        не нужна — файл просто должен быть в этом формате (ровно то, что
+        пишет TTSEngine.synthesize_to_wav())."""
+        if not rel_path:
+            return None
+        path = CHARACTER_DIR / rel_path
+        if not path.exists():
+            logger.warning(f"[audio_cache] Файл не найден: {path} — использую live TTS")
+            return None
+        try:
+            with wave.open(str(path), "rb") as wf:
+                if wf.getframerate() != 48000 or wf.getsampwidth() != 2 or wf.getnchannels() != 1:
+                    logger.warning(f"[audio_cache] {path} не в формате 16-bit/mono/48kHz — использую live TTS")
+                    return None
+                return wf.readframes(wf.getnframes())
+        except Exception as e:
+            logger.error(f"[audio_cache] Ошибка чтения {path}: {e} — использую live TTS")
+            return None
+
+    def _synthesize_or_cached(self, text: str, cached_rel_path: Optional[str]) -> Optional[bytes]:
+        """Единая точка получения аудио ответа: сначала пробуем офлайн-кэш
+        (быстро, TTS не трогается), при любой неудаче — падаем на живой TTS,
+        чтобы отсутствие/поломка файла кэша никогда не оставляла Сорена немым."""
+        cached = self._load_cached_audio(cached_rel_path)
+        if cached is not None:
+            return cached
+        return self.tts.synthesize(text)
+
     def _try_quick_answer(self, user_text: str) -> Optional[dict]:
         """Проверяет словарь быстрых ответов (character/quick_answers.json) ДО
         похода в память и LLM. Если находится совпадение — Сорен отвечает
@@ -482,12 +543,19 @@ class RobotBrain:
         if not QUICK_ANSWERS_ENABLED:
             return None
 
+        # Уровень 1-2: точное/нечёткое совпадение по тексту триггера (дёшево, без эмбеддингов)
         qa = quick_answers.find(user_text)
+        # Уровень 3: семантическое совпадение через Qdrant — ловит случаи, где
+        # формулировка пользователя не похожа по буквам ни на один триггер
+        # ("Сколько тебе лет?" vs "Какой у тебя возраст?"), но означает то же самое
+        if qa is None:
+            qa = semantic_quick_match.find(user_text)
         if qa is None:
             return None
 
-        logger.info(f"⚡ Быстрый ответ '{qa.id}' (без LLM): {user_text!r} -> {qa.response!r}")
-        return {"text": qa.response, "action": qa.action, "emotion": qa.emotion or "calm"}
+        variant = quick_answers.pick_response(qa)
+        logger.info(f"⚡ Быстрый ответ '{qa.id}' (без LLM): {user_text!r} -> {variant.text!r}")
+        return {"text": variant.text, "action": variant.action, "emotion": variant.emotion or "calm", "audio": variant.audio}
 
     def generate_reply(self, user_text: str) -> dict:
         """Единая точка получения ответа Сорена на текст пользователя — сначала
@@ -555,7 +623,7 @@ class RobotBrain:
         emotion = llm_result.get("emotion", "calm")
         servo_angles = self.emotion_engine.get_servo_angles(emotion)
         eye_led = self.emotion_engine.get_eye_led(emotion)
-        tts_audio = self.tts.synthesize(llm_result["text"])
+        tts_audio = self._synthesize_or_cached(llm_result["text"], llm_result.get("audio"))
 
         if tts_audio:
             self.last_tts_audio = tts_audio
@@ -601,6 +669,19 @@ class RobotBrain:
         }
 
     async def process_video_frame(self, frame_bytes: bytes) -> dict:
+        # Пункт 4 (environment stream): пока идёт активный диалог, слежение за
+        # лицом непрерывно пишет углы головы напрямую (см. _process_video_frame_sync)
+        # — это самый быстрый reactive-путь, гонять его через arbiter.request()
+        # на каждый кадр видео было бы избыточно (десятки раз в секунду).
+        # Вместо этого просто РЕЗЕРВИРУЕМ арбитр на Priority.ENVIRONMENT редко
+        # (раз в ~1с, пока диалог активен) — чтобы idle_thoughts/джиттер не
+        # лезли поверх слежения за лицом, не привязываясь к каждому кадру.
+        if self.is_dialog_active():
+            now = time.monotonic()
+            if now - getattr(self, "_last_env_reserve", 0.0) > 0.8:
+                self._last_env_reserve = now
+                await arbiter.request(Priority.ENVIRONMENT, duration_s=1.5, label="face_tracking")
+
         loop = asyncio.get_event_loop()
         # CV-обработка (YOLO/DNN-детектор лица/Pose) — тяжёлая и синхронная,
         # выполняем в отдельном потоке, чтобы не блокировать event loop на время кадра.
@@ -733,6 +814,16 @@ class RobotBrain:
     async def handle_command(self, command: dict) -> dict:
         cmd_type = command.get("type")
 
+        if cmd_type == "emergency_stop":
+            return await self.emergency_stop(reason=command.get("reason", "manual"))
+
+        # Пункт 12: команды прямого управления с панели резервируют арбитра на
+        # Priority.PANEL — это НЕ гейт (панель выполняется всегда, у человека
+        # приоритет), а сигнал остальным источникам (idle/environment) не
+        # лезть со своими анимациями поверх ручного управления следующие 2с.
+        if cmd_type in ("servo", "servo_multi", "animation"):
+            await arbiter.request(Priority.PANEL, duration_s=2.0, label=f"panel:{cmd_type}")
+
         if cmd_type == "servo":
             self.servos.set_servo(command["id"], command["angle"])
             return {"status": "ok", "servo": command["id"], "angle": command["angle"]}
@@ -753,6 +844,48 @@ class RobotBrain:
         elif cmd_type == "reload_animations":
             count = animation_book.reload()
             return {"status": "ok", "animations": animation_book.list_info(), "count": count}
+
+        elif cmd_type in ("walk", "fly", "turn", "takeoff", "land"):
+            # Пункт 9-11: локомоция — источник по умолчанию геймпад (см.
+            # цели проекта: "Геймпад — управление ходьбой и полётом"),
+            # но source можно переопределить (например, тестовый вызов с панели).
+            source = Priority[command.get("source", "GAMEPAD").upper()]
+
+            if cmd_type == "walk":
+                frames = motion_primitives.build_walk(command["distance_cm"])
+            elif cmd_type == "fly":
+                frames = motion_primitives.build_flight_forward(command["distance_cm"])
+            elif cmd_type == "turn":
+                frames = motion_primitives.build_turn(command["angle_deg"])
+            elif cmd_type == "takeoff":
+                frames = motion_primitives.build_takeoff()
+            else:  # "land"
+                frames = motion_primitives.build_landing()
+
+            if not frames:
+                return {"status": "ok", "message": "Нулевая дистанция/угол — команда проигнорирована"}
+
+            duration_s = frames[-1]["time"] / 1000.0
+            accepted = await arbiter.request(source, duration_s, label=f"motion:{cmd_type}")
+            if not accepted:
+                return {"status": "rejected", "message": f"Арбитр занят приоритетнее {source.name}"}
+
+            if self.servos.is_animating:
+                return {"status": "rejected", "message": "Сервы заняты другой анимацией/примитивом"}
+            asyncio.create_task(self.servos.play_motion(frames, on_frame=self.on_servo_frame))
+
+            # Пункт 4: если для этого типа события в quick_answers.json заведена
+            # запись с id вида "motion_takeoff"/"motion_land" — отдаём её sfx/audio
+            # вызывающему коду. САМО воспроизведение (отправка audio-байтов на
+            # устройство/панель) — уже существующий у вас путь для quick_answers,
+            # этот метод лишь передаёт, ЧТО играть, не вызывает TTS/отправку сам.
+            result = {"status": "ok", "motion": cmd_type}
+            qa = quick_answers.get_by_id(f"motion_{cmd_type}")
+            if qa:
+                variant = quick_answers.pick_response(qa)
+                result["sfx"] = variant.sfx
+                result["audio"] = variant.audio
+            return result
 
         elif cmd_type == "text":
             try:
