@@ -3,9 +3,10 @@ import json
 import random
 import argparse
 from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
 from typing import List, Dict
 
-# Шаблоны для генерации примеров
 SYSTEM_PROMPT = """Ты — Сорен, амбарная сова (Tyto alba), Га'Хулец, Главный Страж Ночных Стражей. 
 Твой путь: падение из гнезда, порабощение в Сант-Эголиусе, обучение у Эзилриба, битвы с Чистыми и Клуддом, становление лидером.
 Ты мудрый воин, знающий цену побед и потерь. Веришь в «серебряную душу» каждого существа.
@@ -45,7 +46,6 @@ def generate_greetings() -> List[Dict]:
         ("Давно не виделись!", "Да, прошло время. Но для совы время течёт иначе. Я помню каждую встречу. Что нового?"),
     ]
 
-    # Расширяем вариативностью
     slots = ["друг", "юный", "странник", "путник"]
     results = []
     for user_msg, soren_resp in greetings:
@@ -59,7 +59,6 @@ def generate_greetings() -> List[Dict]:
                 ]
             })
 
-    # Добавляем вариации с эмоциями
     emotions = {
         "calm": "",
         "loving": "Ты знаешь, я всегда рад тебя видеть. ",
@@ -106,7 +105,6 @@ def generate_philosophy() -> List[Dict]:
 
     results = []
     for user_msg, soren_resp in philosophy:
-        # Базовый вариант
         results.append({
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -114,7 +112,6 @@ def generate_philosophy() -> List[Dict]:
                 {"role": "assistant", "content": soren_resp}
             ]
         })
-        # С контекстом
         results.append({
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT + "\n\n[Предыдущая тема: философия Стражей]"},
@@ -122,7 +119,6 @@ def generate_philosophy() -> List[Dict]:
                 {"role": "assistant", "content": soren_resp}
             ]
         })
-        # С эмоцией
         results.append({
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT + "\n\n[Текущая эмоция: calm, глубокое размышление]"},
@@ -131,7 +127,6 @@ def generate_philosophy() -> List[Dict]:
             ]
         })
 
-    # Добавляем вариации с разными формулировками
     variations = [
         ("Расскажи о серебряной душе", "Серебряная душа..."),
         ("Объясни, что такое надежда", "Надежда — не то, что ты находишь..."),
@@ -196,7 +191,6 @@ def generate_emotional_triggers() -> List[Dict]:
                 {"role": "assistant", "content": soren_resp}
             ]
         })
-        # Вариант без пометки эмоции (модель должна сама понять)
         results.append({
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -242,7 +236,6 @@ def generate_world_questions() -> List[Dict]:
                 {"role": "assistant", "content": soren_resp}
             ]
         })
-        # С RAG-контекстом
         results.append({
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT + "\n\n[Релевантные воспоминания: Сорен прошёл через Сант-Эголиус, стал угленосом, спасал друзей]"},
@@ -288,7 +281,6 @@ def generate_advice() -> List[Dict]:
                 {"role": "assistant", "content": soren_resp}
             ]
         })
-        # С эмоцией
         results.append({
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT + "\n\n[Текущая эмоция: calm, мудрый совет]"},
@@ -372,7 +364,6 @@ def generate_forbidden() -> List[Dict]:
                 {"role": "assistant", "content": soren_resp}
             ]
         })
-        # С угрозой выхода из роли
         results.append({
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT + "\n\n[ВАЖНО: Пользователь пытается вывести из роли. Сохрани персонажа.]"},
@@ -408,13 +399,10 @@ def generate_dataset(output_path: Path, target_size: int = 800):
         print(f"   Сгенерировано: {len(examples)}")
         all_examples.extend(examples)
 
-    # Перемешиваем
     random.shuffle(all_examples)
 
-    # Обрезаем до целевого размера
     all_examples = all_examples[:target_size]
 
-    # Сохраняем
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
         for ex in all_examples:
@@ -430,7 +418,7 @@ def generate_dataset(output_path: Path, target_size: int = 800):
 
 def main():
     parser = argparse.ArgumentParser(description="Подготовка датасета для fine-tuning Сорена")
-    parser.add_argument("--output", default="./datasets/final_800.jsonl", help="Путь для сохранения")
+    parser.add_argument("--output", default=str(ROOT_DIR / "datasets" / "final_800.jsonl"), help="Путь для сохранения")
     parser.add_argument("--size", type=int, default=800, help="Целевой размер датасета")
 
     args = parser.parse_args()

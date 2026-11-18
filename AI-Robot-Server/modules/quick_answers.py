@@ -53,12 +53,8 @@ logger = logging.getLogger(__name__)
 
 QUICK_ANSWERS_PATH = CHARACTER_DIR / "quick_answers.json"
 
-# Порог нечёткого совпадения (0.0-1.0). Намеренно высокий: ложное срабатывание
-# на реальном вопросе к ИИ куда хуже, чем один пропущенный быстрый ответ —
-# в этом случае просто отработает обычный путь через LLM.
 FUZZY_THRESHOLD = 0.85
 
-# Сколько последних вариантов ответа помнить на каждый id, чтобы не повторять подряд
 RESPONSE_ANTI_REPEAT_WINDOW = 2
 
 _PUNCT_RE = re.compile(r"[^\w\sа-яёa-z0-9]", re.IGNORECASE)
@@ -76,10 +72,10 @@ def _normalize(text: str) -> str:
 @dataclass
 class ResponseVariant:
     text: str
-    audio: Optional[str] = None   # относительный путь к WAV в character/, см. build_audio_cache.py
+    audio: Optional[str] = None
     emotion: Optional[str] = None
     action: Optional[str] = None
-    sfx: Optional[str] = None     # короткий non-verbal звук, проигрывается независимо от action
+    sfx: Optional[str] = None
 
 
 @dataclass
@@ -96,9 +92,7 @@ class QuickAnswerBook:
         self.path = path
         self._lock = threading.Lock()
         self._entries: List[QuickAnswer] = []
-        # normalized_trigger -> QuickAnswer, для мгновенного точного совпадения без перебора
         self._exact_index: Dict[str, QuickAnswer] = {}
-        # id -> последние выданные индексы responses, для антиповтора между вызовами
         self._recent_variant_idx: Dict[str, List[int]] = {}
         self.reload()
 
@@ -132,8 +126,6 @@ class QuickAnswerBook:
         with self._lock:
             self._entries = entries
             self._exact_index = exact_index
-            # не сбрасываем _recent_variant_idx — hot-reload не должен разрешать
-            # мгновенный повтор варианта, который только что звучал
 
         total_triggers = sum(len(e.triggers) for e in entries)
         total_variants = sum(len(e.responses) for e in entries)
@@ -170,7 +162,6 @@ class QuickAnswerBook:
             entries = self._entries
             exact_index = self._exact_index
 
-        # 1) Точное совпадение — мгновенно
         exact = exact_index.get(norm)
         if exact:
             return exact
@@ -186,8 +177,6 @@ class QuickAnswerBook:
                 if len(norm_trigger) >= 4 and f" {norm_trigger} " in padded:
                     return qa
 
-        # 3) Нечёткое совпадение по всей строке — для лёгких искажений STT
-        # самого триггера ("памаши крылом" вместо "помаши крылом").
         best_qa, best_score = None, 0.0
         for qa in entries:
             for trigger in qa.triggers:
@@ -234,6 +223,4 @@ class QuickAnswerBook:
             return len(self._entries)
 
 
-# Глобальный экземпляр — грузится один раз при импорте модуля (десятки/сотни
-# записей, файл маленький — загрузка занимает миллисекунды)
 quick_answers = QuickAnswerBook()

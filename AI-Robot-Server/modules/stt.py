@@ -9,15 +9,8 @@ from config.settings import (
 
 logger = logging.getLogger(__name__)
 
-# Порог "вероятности отсутствия речи" от самого Whisper (усреднённый по сегментам
-# no_speech_prob). Выше этого — модель сама не уверена, что там вообще была речь,
-# такое почти всегда шум/тишина, даже если что-то "распозналось".
 NO_SPEECH_PROB_THRESHOLD = 0.6
 
-# Известные галлюцинации faster-whisper на тишине/шуме для русского языка —
-# модель обучена в том числе на субтитрах с YouTube и на пустом/шумном входе
-# вместо пустой строки часто выдаёт титровые фразы вроде этих. Точное или
-# частичное совпадение → результат отбрасывается как "речь не распознана".
 HALLUCINATION_PATTERNS = [
     "редактор субтитров",
     "корректор",
@@ -42,7 +35,6 @@ class LocalSTTEngine:
         self.model_size = model_size or WHISPER_MODEL_SIZE
         self.model = None
         self._load_model()
-        # Lazy import fuzzy matcher
         try:
             from modules.fuzzy_matcher import correct_speech_text
             self.correct_text = correct_speech_text
@@ -97,7 +89,7 @@ class LocalSTTEngine:
 
         try:
             segments, info = self.model.transcribe(audio_path, language="ru", beam_size=5)
-            segments = list(segments)  # generator -> список, нужен для двух проходов
+            segments = list(segments)
             text = " ".join(segment.text for segment in segments).strip()
 
             if segments:

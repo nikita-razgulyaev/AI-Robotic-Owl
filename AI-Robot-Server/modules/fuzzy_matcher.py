@@ -6,14 +6,11 @@ from difflib import SequenceMatcher
 class FuzzyMatcher:
     """Адаптивное распознавание речи — заменяет похожие слова на правильные"""
 
-    # Ключевые слова, которые Сорен должен распознавать даже с ошибками
-    # Каждый вариант — это реальная возможная ошибка распознавания
     KEYWORDS = {
         # === ИМЕНА ===
         "сорен": [
             "сорен", "сурон", "сурен", "соран", "сорин", "сорэн", "сорён",
             "соренн", "ссорен", "соренн", "соренн", "соренн", "соренн",
-            # Дополнительные варианты с ошибками распознавания
             "сарен", "серен", "суран", "сурин", "сурэн", "сарон",
             "саран", "сарин", "сарэн", "сарён", "сурён", "сурин",
             "соранн", "суранн", "саренн", "сарен", "суренн",
@@ -215,11 +212,9 @@ class FuzzyMatcher:
         ],
     }
 
-    # Порог схожести (0.0 - 1.0). 0.60 = 60% совпадения символов
     SIMILARITY_THRESHOLD = 0.60
 
     def __init__(self):
-        # Построить обратный индекс: вариант -> каноническое слово
         self.variant_to_canonical = {}
         for canonical, variants in self.KEYWORDS.items():
             for variant in variants:
@@ -236,11 +231,9 @@ class FuzzyMatcher:
         """
         word_lower = word.lower().strip(".,!?;:-'")
 
-        # Точное совпадение
         if word_lower in self.variant_to_canonical:
             return self.variant_to_canonical[word_lower], 1.0
 
-        # Fuzzy matching по всем вариантам
         best_match = None
         best_score = 0.0
 
@@ -260,19 +253,15 @@ class FuzzyMatcher:
         if not text:
             return text
 
-        # Разбиваем на токены: слова и пунктуация
-        # Используем regex, который сохраняет пробелы и пунктуацию
         tokens = re.findall(r"[\w\-'А-Яа-яёЁ]+|[^\w\-'А-Яа-яёЁ]+", text)
         corrected = []
         corrections_made = []
 
         for token in tokens:
-            # Пропускаем пробелы и пунктуацию
             if not re.match(r"[\w\-'А-Яа-яёЁ]+", token):
                 corrected.append(token)
                 continue
 
-            # Пропускаем короткие слова (менее 3 символов)
             clean_word = token.strip(".,!?;:-'")
             if len(clean_word) <= 2:
                 corrected.append(token)
@@ -280,11 +269,9 @@ class FuzzyMatcher:
 
             canonical, score = self.find_best_match(clean_word)
 
-            if canonical and score < 1.0:  # Неточное совпадение — исправляем
-                # Сохраняем регистр первой буквы
+            if canonical and score < 1.0:
                 if token[0].isupper():
                     canonical = canonical[0].upper() + canonical[1:]
-                # Сохраняем оригинальную пунктуацию в конце слова
                 trailing_punct = ""
                 for char in reversed(token):
                     if char in ".,!?;:-': ":
@@ -304,7 +291,6 @@ class FuzzyMatcher:
         return "".join(corrected)
 
 
-# Глобальный экземпляр
 fuzzy_matcher = FuzzyMatcher()
 
 

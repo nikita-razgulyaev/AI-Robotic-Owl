@@ -29,7 +29,6 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 QUICK_ANSWERS_PATH = CHARACTER_DIR / "quick_answers.json"
-AUDIO_CACHE_DIR = CHARACTER_DIR.parent / "audio_cache"
 
 
 def main():
@@ -45,7 +44,6 @@ def main():
     with open(QUICK_ANSWERS_PATH, "r", encoding="utf-8") as f:
         entries = json.load(f)
 
-    AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tts = TTSEngine()
 
     total = 0
@@ -57,9 +55,6 @@ def main():
         entry_id = entry.get("id", "?")
         responses = entry.get("responses")
         if not responses:
-            # старая форма ('response' без 'responses') — офлайн-кэш под неё
-            # не строим: смысл миграции на 'responses' как раз в том, чтобы
-            # явно проставить путь 'audio' для каждой записи, которую хотим кэшировать
             continue
 
         for i, resp in enumerate(responses):

@@ -3,6 +3,9 @@ import os
 import sys
 from pathlib import Path
 
+MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+MODELS_DIR.mkdir(exist_ok=True)
+
 def download_with_hf_hub():
     """Скачивает модель через hf_hub_download (автоматически собирает части)"""
     try:
@@ -10,11 +13,10 @@ def download_with_hf_hub():
         print("Скачивание Qwen2.5-7B-Instruct-GGUF...")
         print("Это займет 10-30 минут в зависимости от интернета.\n")
 
-        # hf_hub_download автоматически обрабатывает разбитые файлы
         downloaded_path = hf_hub_download(
             repo_id="Qwen/Qwen2.5-7B-Instruct-GGUF",
             filename="qwen2.5-7b-instruct-q4_k_m.gguf",
-            local_dir="./models",
+            local_dir=str(MODELS_DIR),
             local_dir_use_symlinks=False,
             resume_download=True
         )
@@ -34,7 +36,7 @@ def download_parts_manually():
     import urllib.request
     from tqdm import tqdm
 
-    models_dir = Path("./models")
+    models_dir = MODELS_DIR
     models_dir.mkdir(exist_ok=True)
 
     base_url = "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/"
@@ -70,7 +72,6 @@ def download_parts_manually():
             print(f"✗ Ошибка скачивания {filename}: {e}")
             return False
 
-    # Собираем части
     print("Сборка модели из частей...")
     output_file = models_dir / "qwen2.5-7b-instruct-q4_k_m.gguf"
 
@@ -85,11 +86,6 @@ def download_parts_manually():
     print(f"\n✅ Модель собрана: {output_file}")
     print(f"   Размер: {size_mb:.1f} MB")
 
-    # Удаляем части (опционально)
-    # for filename in files:
-    #     (models_dir / filename).unlink()
-    # print("Части удалены")
-
     return True
 
 
@@ -99,7 +95,6 @@ def main():
     print("=" * 60)
     print()
 
-    # Пробуем через hf_hub_download
     if download_with_hf_hub():
         return
 

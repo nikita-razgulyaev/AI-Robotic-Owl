@@ -32,9 +32,5 @@ def is_night(latitude: float, longitude: float, tz_name: str, now: Optional[date
             return True
         return False
     except Exception as e:
-        # Полярный день/ночь на экстремальных широтах может уронить расчёт
-        # (astral кидает ValueError, если солнце не восходит/не заходит) —
-        # в этом случае считаем "не ночь", чтобы не залипнуть в вечно горящей
-        # или вечно потушенной подсветке по ошибке.
         logger.error(f"Не удалось посчитать закат/рассвет ({latitude},{longitude},{tz_name}): {e}")
         return False

@@ -5,6 +5,8 @@ import torch
 import argparse
 from pathlib import Path
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
+
 try:
     from transformers import (
         AutoModelForCausalLM, AutoTokenizer, 
@@ -79,7 +81,6 @@ def train_lora_cpu(
     print(f"   ⚠️ CPU-only — будет медленно!")
     print()
 
-    # 1. Загружаем токенизатор
     print("📖 Загрузка токенизатора...")
     tokenizer = AutoTokenizer.from_pretrained(
         base_model_path,
@@ -88,7 +89,6 @@ def train_lora_cpu(
     )
     tokenizer.pad_token = tokenizer.eos_token
 
-    # 2. Загружаем модель в fp16 (без квантизации)
     print("🧠 Загрузка модели (fp16)...")
     print("   ⏳ Это займёт время и ~14 GB RAM...")
 
@@ -103,7 +103,6 @@ def train_lora_cpu(
     print(f"   ✅ Модель загружена")
     print(f"   📊 Параметров: {sum(p.numel() for p in model.parameters()) / 1e6:.0f}M")
 
-    # 3. Настройка LoRA
     print("⚙️ Настройка LoRA...")
     target_modules = find_all_linear_names(model)
     print(f"   Target modules: {target_modules[:5]}...")
@@ -120,12 +119,10 @@ def train_lora_cpu(
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # 4. Загружаем датасет
     print("📊 Загрузка датасета...")
     dataset = load_dataset(dataset_path)
     print(f"   Примеров: {len(dataset)}")
 
-    # 5. Токенизация
     def tokenize_function(examples):
         return tokenizer(
             examples["text"],
@@ -136,7 +133,6 @@ def train_lora_cpu(
 
     tokenized_dataset = dataset.map(tokenize_function, batched=True)
 
-    # 6. Настройка обучения (CPU-оптимизировано)
     print("🏋️ Начало обучения...")
     print("   ⏳ Это займёт время...")
 
@@ -169,10 +165,8 @@ def train_lora_cpu(
         data_collator=data_collator,
     )
 
-    # 7. Обучение
     trainer.train()
 
-    # 8. Сохранение
     print("💾 Сохранение адаптера...")
     adapter_dir = output_dir / "adapter"
     model.save_pretrained(str(adapter_dir))
@@ -180,7 +174,6 @@ def train_lora_cpu(
 
     print(f"✅ Готово! Адаптер сохранён в: {adapter_dir}")
 
-    # Показываем размер
     import glob
     files = glob.glob(str(adapter_dir / "*"))
     total = sum(os.path.getsize(f) for f in files if os.path.isfile(f))
@@ -192,8 +185,8 @@ def train_lora_cpu(
 def main():
     parser = argparse.ArgumentParser(description="Fine-tuning Сорена на CPU")
     parser.add_argument("--base-model", default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--dataset", default="./datasets/curated_v1_fixed.jsonl")
-    parser.add_argument("--output", default="./models/lora_output")
+    parser.add_argument("--dataset", default=str(ROOT_DIR / "datasets" / "curated_v1_fixed.jsonl"))
+    parser.add_argument("--output", default=str(ROOT_DIR / "models" / "lora_output"))
     parser.add_argument("--r", type=int, default=4)
     parser.add_argument("--alpha", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1)

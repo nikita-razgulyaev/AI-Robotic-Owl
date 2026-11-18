@@ -12,7 +12,7 @@ from typing import List, Tuple, Optional, Dict
 
 logger = logging.getLogger(__name__)
 
-BBox = Tuple[int, int, int, int]  # x, y, w, h
+BBox = Tuple[int, int, int, int]
 
 
 class FaceTrack:
@@ -49,9 +49,6 @@ class FaceTracker:
         unmatched_detections = list(range(len(detections)))
         matched_track_ids = set()
 
-        # Жадное сопоставление: для каждого существующего трека ищем ближайшую
-        # детекцию в пределах max_distance (простая, но достаточная эвристика
-        # для 1-3 лиц в кадре, без тяжёлого венгерского алгоритма).
         for track_id, track in self.tracks.items():
             if not unmatched_detections:
                 break
@@ -70,14 +67,12 @@ class FaceTracker:
                 matched_track_ids.add(track_id)
                 unmatched_detections.remove(best_idx)
 
-        # Детекции без пары — новые люди в кадре
         for idx in unmatched_detections:
             track = FaceTrack(self._next_id, detections[idx])
             self.tracks[self._next_id] = track
             matched_track_ids.add(self._next_id)
             self._next_id += 1
 
-        # Треки без детекции в этом кадре — увеличиваем счётчик "потерян"
         visible_tracks = []
         dead_ids = []
         for track_id, track in self.tracks.items():

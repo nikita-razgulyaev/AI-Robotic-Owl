@@ -28,12 +28,11 @@ logger = logging.getLogger(__name__)
 
 class Priority(IntEnum):
     """Меньше число — выше приоритет."""
-    SAFETY = 0        # аппаратные рефлексы/аварийная остановка (обычно с прошивки,
-                       # но зарезервировано и здесь на случай серверной safety-логики)
-    PANEL = 1          # явная команда с веб-панели — прямое намерение человека
-    GAMEPAD = 2        # геймпад — тоже прямое намерение человека, но ниже панели
-    ENVIRONMENT = 3    # реакция на окружение (лицо в кадре, звук, распознанная фраза)
-    INDEPENDENT = 4    # фоновые idle-паттерны — низший приоритет, перебивается всем
+    SAFETY = 0
+    PANEL = 1
+    GAMEPAD = 2
+    ENVIRONMENT = 3
+    INDEPENDENT = 4
 
 
 class Arbiter:
@@ -56,10 +55,6 @@ class Arbiter:
         self._active_until: float = 0.0
         self._active_label: str = ""
         self._lock = asyncio.Lock()
-        # Пункт 1 (метрики): (timestamp, priority, label) на каждую УСПЕШНУЮ
-        # выдачу — чтобы видеть, кто как часто реально перехватывает
-        # управление. Ограничено по размеру, а не только по времени — если
-        # что-то начнёт спамить запросами, список не будет расти бесконечно.
         self._grant_log: deque = deque(maxlen=2000)
 
     @staticmethod
@@ -131,6 +126,4 @@ class Arbiter:
         return counts
 
 
-# Глобальный экземпляр — один арбитр на сервер, как и остальные синглтоны
-# в этом проекте (quick_answers, animation_book)
 arbiter = Arbiter()

@@ -33,7 +33,6 @@ def verify_session_token(token: Optional[str]) -> bool:
     payload, _, signature = token.partition(".")
     expected_signature = hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
-    # compare_digest — защита от timing-атак при сравнении подписи
     if not hmac.compare_digest(signature, expected_signature):
         return False
 

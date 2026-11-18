@@ -183,11 +183,6 @@ class CloudLLMEngine:
             self.system_prompt = "Ты — Сорен, амбарная сова, Главный Страж. Отвечай мудро и сдержанно."
 
     def _load_rag(self):
-        # Грузим тяжёлые ресурсы (Qdrant, sentence-transformers энкодер, файл
-        # канона) только если уровень "rag" включён по умолчанию (обычно = not
-        # fast_mode). Если выключен, self.vector_rag/keyword_rag остаются None —
-        # _ensure_rag_loaded() поднимет их лениво, если уровень включат из
-        # панели уже во время работы сервера.
         if memory_flags.get_flags().get("rag", not FAST_MODE):
             self._ensure_rag_loaded()
         else:
@@ -275,7 +270,8 @@ class CloudLLMEngine:
             return {
                 "text": "HF_TOKEN не задан. Получи токен на https://huggingface.co/settings/tokens (с правом Make calls to Inference Providers) и добавь в .env",
                 "action": None,
-                "emotion": "calm"
+                "emotion": "calm",
+                "error": "no_api_key",
             }
 
         try:
@@ -312,13 +308,14 @@ class CloudLLMEngine:
                 try:
                     error_data = response.json()
                     error_msg = error_data.get("error", {}).get("message", f"HTTP {response.status_code}")
-                except:
+                except Exception:
                     error_msg = f"HTTP {response.status_code}: {response.text[:200]}"
                 logger.error(f"HF Inference Providers ошибка: {error_msg}")
                 return {
                     "text": f"*(пауза)* ... Прости, друг. Ветер сменил направление. Повтори, пожалуйста. (Ошибка: {error_msg})",
                     "action": None,
-                    "emotion": "calm"
+                    "emotion": "calm",
+                    "error": error_msg,
                 }
 
             response_text = re.sub(r'^(Сорен:|Assistant:|AI:)', '', response_text).strip()
@@ -345,7 +342,8 @@ class CloudLLMEngine:
             return {
                 "text": "*(пауза)* ... Прости, друг. Мысли улетели далеко. Повтори, пожалуйста.",
                 "action": None,
-                "emotion": "calm"
+                "emotion": "calm",
+                "error": str(e),
             }
 
     def clear_history(self):
@@ -386,11 +384,6 @@ class LocalLLMEngine:
             self.system_prompt = "Ты — Сорен, амбарная сова, Главный Страж. Отвечай мудро и сдержанно."
 
     def _load_rag(self):
-        # Грузим тяжёлые ресурсы (Qdrant, sentence-transformers энкодер, файл
-        # канона) только если уровень "rag" включён по умолчанию (обычно = not
-        # fast_mode). Если выключен, self.vector_rag/keyword_rag остаются None —
-        # _ensure_rag_loaded() поднимет их лениво, если уровень включат из
-        # панели уже во время работы сервера.
         if memory_flags.get_flags().get("rag", not FAST_MODE):
             self._ensure_rag_loaded()
         else:
@@ -572,11 +565,6 @@ class LLMEngine:
         self.local_engine = None
         self.cloud_engine = None
         self.memory = memory_manager
-        # Текущая выбранная модель (id из config.yaml llm.local_models/cloud_models).
-        # Если текущий путь/имя модели не совпадает ни с одним элементом
-        # куратированного списка (например, задан вручную в config.yaml),
-        # используем сам путь/имя как id — панель тогда просто не подсветит
-        # ни один пункт списка активным, но всё продолжит работать.
         self.local_model_id = self._find_local_model_id(str(LLM_MODEL_PATH) if LLM_MODEL_PATH else None)
         self.cloud_model_id = self._find_cloud_model_id(CLOUD_MODEL_NAME)
 
@@ -662,6 +650,14 @@ class LLMEngine:
         if engine is not None:
             engine._ensure_rag_loaded()
 
+    def _get_local_fallback(self) -> "LocalLLMEngine":
+        """Ленивая инициализация локальной модели — только когда облако реально
+        недоступно, чтобы не грузить GGUF при старте в cloud-режиме."""
+        if self.local_engine is None:
+            logger.info("💻 Инициализирую локальный LLM как запасной вариант...")
+            self.local_engine = LocalLLMEngine(self.memory)
+        return self.local_engine
+
     def generate(self, user_message: str, vision_context: str = "", memory_context: Optional[str] = None) -> dict:
         # Если вызывающий код (RobotBrain._build_memory_context) уже собрал контекст
         # памяти (включая релевантные долгосрочные воспоминания из Qdrant) — используем
@@ -673,6 +669,16 @@ class LLMEngine:
 
         if self.mode == "cloud" and self.cloud_engine:
             result = self.cloud_engine.generate(user_message, vision_context, memory_context)
+            if result.get("error"):
+                logger.warning(
+                    f"☁️ Облачный LLM недоступен ({result.get('error')}) — "
+                    f"переключаюсь на локальную модель"
+                )
+                local = self._get_local_fallback()
+                if local and local.model is not None:
+                    result = local.generate(user_message, vision_context, memory_context)
+                else:
+                    logger.error("Локальный LLM тоже недоступен — отдаю сообщение об ошибке")
         elif self.local_engine:
             result = self.local_engine.generate(user_message, vision_context, memory_context)
         else:

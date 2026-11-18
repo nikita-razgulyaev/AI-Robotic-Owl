@@ -27,12 +27,8 @@ from modules.quick_answers import quick_answers, QuickAnswer
 logger = logging.getLogger(__name__)
 
 COLLECTION_NAME = "soren_quick_answer_triggers"
-VECTOR_SIZE = 384  # размерность RAG_ENCODER_MODEL (paraphrase-multilingual-MiniLM-L12-v2)
+VECTOR_SIZE = 384
 
-# Порог косинусной близости для семантического совпадения. Выше, чем можно
-# было бы ожидать для "просто похожих" фраз — ложное срабатывание здесь
-# означает подмену настоящего ответа LLM заранее заготовленным не по теме,
-# это хуже, чем один лишний поход в LLM.
 SEMANTIC_THRESHOLD = 0.80
 
 
@@ -68,10 +64,6 @@ class SemanticQuickMatch:
         points = []
         id_to_qa = {}
         point_id = 0
-        # entries доступны только через find()/count() в публичном API
-        # quick_answers, поэтому проходим по триггерам через служебный доступ
-        # к _entries — сознательно завязываемся на внутренний список, т.к.
-        # это тот же модуль проекта, а не сторонняя библиотека
         for qa in quick_answers._entries:
             for trigger in qa.triggers:
                 vector = encode_text(trigger)
@@ -118,9 +110,4 @@ class SemanticQuickMatch:
         return qa
 
 
-# Глобальный экземпляр — индекс строится один раз при старте (как и
-# quick_answers). Если нужно подхватить правки quick_answers.json без
-# перезапуска сервера — вызвать quick_answers.reload(), затем
-# semantic_quick_match.build_index() (например, из одного HTTP-эндпоинта
-# /quick_answers/reload).
 semantic_quick_match = SemanticQuickMatch()

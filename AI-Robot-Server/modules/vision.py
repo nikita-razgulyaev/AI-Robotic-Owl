@@ -42,7 +42,6 @@ _COLOR_TRACKING = (46, 204, 113)
 _COLOR_IDLE = (140, 140, 140)
 _COLOR_OTHER = (90, 90, 90)
 
-# FIX: панельный кадр считается "свежим" только в течение этого времени.
 PANEL_FRAME_MAX_AGE_SEC = 3.0
 
 
@@ -65,7 +64,7 @@ class VisionEngine:
                     logger.error(f"Ошибка загрузки YOLO: {e}")
             else:
                 logger.warning(f"YOLO модель не найдена: {YOLO_MODEL}")
-                logger.info("Скачай: python download_yolo.py")
+                logger.info("Скачай: python scripts/download_yolo.py")
 
         self._init_face_detector()
 
@@ -191,7 +190,6 @@ class VisionEngine:
             frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             if frame is None:
                 return False
-            # FIX: поворот 90° вправо (по запросу — камера установлена на боку)
             frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
             self._panel_frame = frame
             self._panel_frame_ts = time.time()
@@ -206,8 +204,6 @@ class VisionEngine:
         трек умер или ещё не выбран."""
         current = self.tracker.get_track(self.target_track_id) if self.target_track_id is not None else None
         if current is not None:
-            # Трек ещё в памяти FaceTracker — не переключаемся, чтобы не было
-            # резкого snap\'a при кратковременном пропадании на 1–2 кадра.
             return
 
         if tracks:
@@ -223,7 +219,6 @@ class VisionEngine:
             if frame is None:
                 return {"error": "Не удалось декодировать кадр"}
 
-            # FIX: поворот 90° вправо (камера установлена на боку)
             frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 
             self.last_frame = frame
@@ -240,7 +235,6 @@ class VisionEngine:
                 "description": ""
             }
 
-            # 1. YOLO Detection (троттлится)
             now = time.time()
             if self.yolo is not None and (now - self._last_yolo_run_ts) >= YOLO_DETECTION_INTERVAL_SEC:
                 self._last_yolo_run_ts = now
@@ -267,7 +261,6 @@ class VisionEngine:
                     logger.error(f"Ошибка YOLO: {e}")
             result["objects"] = self._cached_objects
 
-            # 2. Детекция лиц + трекинг + выбор цели
             face_boxes = self._detect_faces(frame)
             tracks = self.tracker.update(face_boxes)
             self._select_target(tracks)
@@ -288,7 +281,6 @@ class VisionEngine:
                 self.face_position = None
                 self.face_bbox = None
 
-            # 3. Pose Tracking (троттлится)
             if self.pose is not None and (now - self._last_pose_run_ts) >= POSE_DETECTION_INTERVAL_SEC:
                 self._last_pose_run_ts = now
                 try:
@@ -417,15 +409,24 @@ class VisionEngine:
 
     def get_servo_angles_from_pose(self) -> List[int]:
         """Углы серв ТОЛЬКО плеч/локтей (0-3) из MediaPipe Pose.
-        Голову (14/15) и клюв/крен (16/17) эта функция сознательно не трогает —
+        Голову (17/18) и клюв/крен (19/20) эта функция сознательно не трогает —
         головой рулит исключительно трекинг лица (face offset) в robot_brain.py,
-        а прежняя запись позиции носа в angles[16]/angles[17] была ошибкой:
+        а прежняя запись позиции носа в angles[19]/angles[20] была ошибкой:
         по прошивке это HEAD_ROLL_INDEX/BEAK_INDEX, а не что-либо связанное
-        с носом или с трекингом лица."""
-        if self.last_pose_landmarks is None:
-            return [90] * 18
+        с носом или с трекингом лица.
 
-        angles = [90] * 18
+        ⚠ ВАЖНО после добавления 2-й платы PCA9685: индексы 0-3 раньше были
+        парами крыльев (L_FLAP/L_FOLD/R_FLAP/R_FOLD), сейчас — 0=L_WING_FLAP,
+        1=L_WING_FOLD, 2=L_WING_TILT, 3=R_WING_FLAP (см. схему серв). Функция
+        по-прежнему пишет 4 числа подряд в эти индексы, не зная их нового
+        смысла — физически это уже не "обе стороны по 2 сустава", а "левое
+        крыло полностью + один канал правого". Если это экспериментальная
+        функция копирования жестов — её целевые индексы стоит пересмотреть
+        под новую карту, а не оставлять как есть."""
+        if self.last_pose_landmarks is None:
+            return [90] * 22
+
+        angles = [90] * 22
 
         try:
             left_shoulder = self.last_pose_landmarks[11]

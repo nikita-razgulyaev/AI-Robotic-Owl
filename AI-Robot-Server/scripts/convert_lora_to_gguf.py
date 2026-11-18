@@ -5,6 +5,8 @@ import argparse
 import torch
 from pathlib import Path
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
+
 
 def convert_lora_to_gguf(
     base_model_path: str,
@@ -32,8 +34,7 @@ def convert_lora_to_gguf(
     print(f"   Выход: {output_path}")
     print()
 
-    # Проверяем наличие llama.cpp
-    llama_cpp_dir = Path(os.getenv("LLAMA_CPP_DIR", "./llama.cpp"))
+    llama_cpp_dir = Path(os.getenv("LLAMA_CPP_DIR", str(ROOT_DIR / "llama.cpp")))
     if not llama_cpp_dir.exists():
         print(f"❌ llama.cpp не найден в {llama_cpp_dir}")
         print("   Скачай: git clone https://github.com/ggerganov/llama.cpp")
@@ -49,7 +50,6 @@ def convert_lora_to_gguf(
         print("   Убедись, что llama.cpp обновлён до последней версии")
         return False
 
-    # Способ 1: Через merge_and_unload + конвертация в GGUF
     print("📦 Способ 1: Merge LoRA + конвертация...")
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -70,7 +70,6 @@ def convert_lora_to_gguf(
         print("   Слияние весов...")
         model = model.merge_and_unload()
 
-        # Сохраняем merged модель
         merged_dir = Path(adapter_path) / "merged"
         merged_dir.mkdir(exist_ok=True)
         model.save_pretrained(str(merged_dir))
@@ -87,7 +86,6 @@ def convert_lora_to_gguf(
         print(f"   ❌ Ошибка: {e}")
         print()
 
-    # Способ 2: Прямая конвертация через llama.cpp
     print("📦 Способ 2: Прямая конвертация через llama.cpp...")
     print(f"   python {convert_script} {adapter_path} --outtype {out_type}")
     print()
@@ -101,7 +99,7 @@ def main():
     parser = argparse.ArgumentParser(description="Конвертация LoRA в GGUF")
     parser.add_argument("--base", required=True, help="Путь к базовой модели")
     parser.add_argument("--adapter", required=True, help="Путь к LoRA адаптеру")
-    parser.add_argument("--out", default="./models/soren_lora.gguf", help="Выходной файл")
+    parser.add_argument("--out", default=str(ROOT_DIR / "models" / "soren_lora.gguf"), help="Выходной файл")
     parser.add_argument("--outtype", default="q4_k_m", help="Тип квантизации")
 
     args = parser.parse_args()

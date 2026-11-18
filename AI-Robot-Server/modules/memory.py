@@ -168,11 +168,6 @@ class LongTermMemory:
     """Долгосрочная память через Qdrant с векторными эмбеддингами"""
 
     def __init__(self):
-        # self.enabled — "поднят ли клиент Qdrant" (возможность), а не "включён ли
-        # уровень памяти прямо сейчас" (это memory_flags.get_flags()["ltm"],
-        # проверяется отдельно в каждом save_*/search_*). Поднимаем клиент сразу,
-        # только если LTM включена по дефолту (config.yaml/FAST_MODE) — иначе
-        # лениво поднимем через ensure_ready() при первом включении из панели.
         self.enabled = False
         self.client = None
         if memory_flags.get_flags().get("ltm", LONG_TERM_MEMORY_ENABLED):
@@ -189,7 +184,6 @@ class LongTermMemory:
         try:
             from qdrant_client.models import Distance, VectorParams
 
-            # Используем общий синглтон
             self.client = get_qdrant_client()
             self.enabled = True
             logger.info(f"✅ Qdrant LTM подключён (shared client)")
@@ -346,8 +340,6 @@ class MemoryManager:
         self.profile = self._load_profile()
 
     def _load_profile(self) -> EmotionalProfile:
-        # Если уровень "профиль" выключен (по умолчанию из-за fast_mode или
-        # вручную из панели) — не читаем ничего с диска, пустой профиль в RAM.
         if not memory_flags.get_flags().get("profile", not FAST_MODE):
             return EmotionalProfile(user_id=self.user_id)
         profile_path = MEMORY_DIR / f"user_{self.user_id}_profile.json"
@@ -361,7 +353,6 @@ class MemoryManager:
         return EmotionalProfile(user_id=self.user_id)
 
     def save_profile(self):
-        # Уровень "профиль" выключен — не пишем ничего на диск.
         if not memory_flags.get_flags().get("profile", not FAST_MODE):
             return
         profile_path = MEMORY_DIR / f"user_{self.user_id}_profile.json"
@@ -376,9 +367,6 @@ class MemoryManager:
         независимо проверяется через memory_flags"""
         flags = memory_flags.get_flags()
 
-        # Краткосрочная — RAM only, нужна для связности диалога в пределах текущей
-        # сессии, никакой записи на диск/в БД. Единственный уровень, включённый
-        # по умолчанию даже в fast_mode, но тоже переключаемый через панель.
         if flags.get("stm", True):
             self.short_term.add_turn("user", user_text)
             self.short_term.add_turn("assistant", soren_text, emotion)
@@ -387,8 +375,6 @@ class MemoryManager:
         profile_on = flags.get("profile", True)
 
         if not ltm_on and not profile_on:
-            # Ни долгосрочной памяти, ни профиля — максимальная скорость
-            # (эквивалент старого FAST_MODE, но настраивается отдельно для каждого).
             return
 
         now = datetime.now().isoformat()
@@ -399,13 +385,11 @@ class MemoryManager:
             self._update_habits(user_text, soren_text)
 
         if ltm_on:
-            # Долгосрочная — диалог
             user_turn = DialogueTurn(timestamp=now, role="user", text=user_text)
             soren_turn = DialogueTurn(timestamp=now, role="assistant", text=soren_text, emotion=emotion)
             self.long_term.save_dialogue_turn(user_turn, self.user_id)
             self.long_term.save_dialogue_turn(soren_turn, self.user_id)
 
-            # Долгосрочная — эмоциональный момент
             if soren_turn.is_deep:
                 moment = EmotionalMoment(
                     timestamp=now,
@@ -420,7 +404,6 @@ class MemoryManager:
                 if profile_on:
                     self.profile.key_moments.append(asdict(moment))
 
-            # Долгосрочная — факты
             self._extract_facts(user_text, now)
 
         if profile_on:
@@ -462,7 +445,6 @@ class MemoryManager:
         """Извлекает факты о пользователе из текста"""
         text_lower = user_text.lower()
 
-        # Имя
         if "меня зовут" in text_lower or "моё имя" in text_lower:
             import re
             match = re.search(r"(?:меня зовут|моё имя)[\s\w]*([А-Я][а-я]+)", user_text)
@@ -475,7 +457,6 @@ class MemoryManager:
                 )
                 self.long_term.save_fact(fact, self.user_id)
 
-        # Страхи
         fear_words = ["боюсь", "страшно", "боязнь", "страх"]
         for word in fear_words:
             if word in text_lower:
@@ -488,7 +469,6 @@ class MemoryManager:
                 self.long_term.save_fact(fact, self.user_id)
                 break
 
-        # Радость
         joy_words = ["рад", "счастлив", "люблю", "нравится", "обожаю"]
         for word in joy_words:
             if word in text_lower:
@@ -539,25 +519,20 @@ class MemoryManager:
         stm = self.short_term.get_context() if flags.get("stm", True) else ""
 
         if not flags.get("profile", not FAST_MODE):
-            # Только последние реплики текущего диалога — без профиля,
-            # доминантных эмоций и привычек (это лишние токены в промпте).
             return f"Последние реплики:\n{stm}" if stm else ""
 
         parts = []
         if stm:
             parts.append(f"Последние реплики:\n{stm}")
 
-        # Эмоциональный профиль
         dom = max(self.profile.dominant_emotions, key=self.profile.dominant_emotions.get)
         parts.append(f"Доминантная эмоция пользователя: {dom}")
 
-        # Триггеры
         if self.profile.triggers["joy"]:
             parts.append(f"Что радует пользователя: {', '.join(self.profile.triggers['joy'][:3])}")
         if self.profile.triggers["fear"]:
             parts.append(f"Что тревожит пользователя: {', '.join(self.profile.triggers['fear'][:3])}")
 
-        # Привычки
         if self.profile.habits["favorite_topics"]:
             parts.append(f"Любимые темы: {', '.join(self.profile.habits['favorite_topics'][:3])}")
 
@@ -570,21 +545,18 @@ class MemoryManager:
 
         memories = []
 
-        # Ищем эмоциональные моменты
         moments = self.long_term.search_emotional_moments(query, limit=2)
         if moments:
             memories.append("Ключевые моменты:")
             for m in moments:
                 memories.append(f"  - [{m.get('category', '')}] {m.get('trigger', '')}")
 
-        # Ищем факты
         facts = self.long_term.search_facts(query, limit=2)
         if facts:
             memories.append("Факты о пользователе:")
             for f in facts:
                 memories.append(f"  - {f.get('content', '')}")
 
-        # Ищем похожие диалоги
         dialogues = self.long_term.search_dialogue_by_context(query, limit=2)
         if dialogues:
             memories.append("Похожие разговоры:")

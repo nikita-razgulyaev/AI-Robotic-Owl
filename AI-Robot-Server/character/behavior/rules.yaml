@@ -1,0 +1,70 @@
+# Правила реакций Сорена на события опоры (кнопка в лапе + кнопка в крыле).
+# Правятся руками; применить без рестарта сервера: POST /behavior/reload
+#
+# Как читается правило
+#   when  — условие:
+#     event        одно из: support_lost, support_regained, grabbed, released, touchdown
+#     prev_state   (необязательно) состояние ДО события: список из standing, held, held_touch, none
+#     state        (необязательно) состояние ПОСЛЕ события — те же значения
+#     self_takeoff (необязательно) true = событие случилось в окне после нашей команды
+#                  взлёта, false = нет (т.е. например падение, а не взлёт)
+#     emotion      (необязательно) текущая эмоция Сорена, список имён из character/Soren_emotions.json
+#   do    — реакция (любую часть можно пропустить / поставить null):
+#     anim         имя анимации из character/animations/*.json (без .json). Нет анимации —
+#                  остальное выполнится, в лог уйдёт предупреждение
+#     emotion      новая эмоция (имя из Soren_emotions.json: calm, curious, greeting,
+#                  sleepy, alert, playful, shy, proud, displeased)
+#     phrase       id записи из character/quick_answers.json (короткая реакция голосом)
+#     priority     SAFETY | PANEL | GAMEPAD | ENVIRONMENT | INDEPENDENT  (по умолчанию ENVIRONMENT).
+#                  SAFETY может перебить любое текущее движение
+#     cooldown_sec пауза до повторного срабатывания этого правила
+#     hold_sec     сколько секунд держать арбитра, если анимации нет (по умолчанию 1)
+#
+# Правила проверяются СВЕРХУ ВНИЗ, срабатывает ПЕРВОЕ подходящее.
+#
+# Состояния опоры (кнопки лапа/крыло):
+#   standing   лапа нажата, крыло нет      стоит на опоре
+#   held       крыло нажато, лапа нет      держат в руках на весу
+#   held_touch нажаты обе                  держат, лапа касается опоры (ставят/берут)
+#   none       не нажата ни одна           опоры нет (полёт, прыжок, падение)
+
+rules:
+  # Потеря опоры, когда мы сами не взлетали, — падение
+  - id: fall_unplanned
+    when: {event: support_lost, self_takeoff: false}
+    do: {anim: fall_react, emotion: alert, phrase: behavior_fall, priority: SAFETY, cooldown_sec: 2}
+
+  # Тот, кто держал, отпустил в воздухе
+  - id: released_in_air
+    when: {event: released}
+    do: {anim: fall_react, emotion: alert, phrase: behavior_fall, priority: SAFETY, cooldown_sec: 2}
+
+  # Подхватили в воздухе руками
+  - id: caught_in_air
+    when: {event: grabbed, prev_state: [none]}
+    do: {anim: grabbed_react, emotion: alert, priority: SAFETY}
+
+  # Взяли с опоры
+  - id: grabbed_from_standing
+    when: {event: grabbed, prev_state: [standing]}
+    do: {anim: grabbed_react, emotion: curious, priority: ENVIRONMENT, cooldown_sec: 3}
+
+  # Приземлились после падения (не после нашего полёта)
+  - id: touchdown_after_fall
+    when: {event: touchdown, self_takeoff: false}
+    do: {anim: recover_stand, emotion: calm, phrase: behavior_relief, priority: SAFETY, cooldown_sec: 2}
+
+  # Поставили обратно на опору
+  - id: put_down
+    when: {event: support_regained}
+    do: {anim: settle_after_put, emotion: calm, priority: ENVIRONMENT, cooldown_sec: 3}
+
+  # Примеры, которые можно включить позже:
+  #
+  # - id: landed_after_flight          # приземлился после собственного полёта
+  #   when: {event: touchdown, self_takeoff: true}
+  #   do: {emotion: proud, priority: ENVIRONMENT}
+  #
+  # - id: liftoff                      # оторвался при собственном взлёте (по умолчанию правила нет)
+  #   when: {event: support_lost, self_takeoff: true}
+  #   do: {emotion: determined, priority: ENVIRONMENT}

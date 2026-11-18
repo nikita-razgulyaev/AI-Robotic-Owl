@@ -7,9 +7,6 @@ venv/
 # === Models ===
 models/
 
-# === Audio Cache ===
-audio_cache/
-
 # === Environment ===
 .env
 

@@ -35,7 +35,7 @@ async def run_tests():
         response = await ws.recv()
         print(f"   Servo 0 → 45°: {json.loads(response).get('status')}")
 
-        angles = [90] * 18
+        angles = [90] * 22
         angles[0] = 45
         angles[1] = 135
         await ws.send(json.dumps({"type": "servo_multi", "angles": angles}))

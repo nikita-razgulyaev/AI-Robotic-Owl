@@ -22,7 +22,6 @@ from modules.animation_loader import animation_book
 
 logger = logging.getLogger(__name__)
 
-# Сколько последних анимаций помнить, чтобы не повторять подряд
 ANTI_REPEAT_WINDOW = 3
 
 
@@ -100,7 +99,7 @@ class IdleThoughts:
                 await asyncio.sleep(random.uniform(self._min_interval, self._max_interval))
 
                 if not arbiter.can_preempt(Priority.INDEPENDENT):
-                    continue  # арбитр занят кем-то приоритетнее — тихо ждём следующий тик
+                    continue
 
                 name = self._pick_next()
                 if name is None:
@@ -114,7 +113,7 @@ class IdleThoughts:
 
                 accepted = await arbiter.request(Priority.INDEPENDENT, duration_s, label=f"idle:{name}")
                 if not accepted:
-                    continue  # арбитр забрал кто-то приоритетнее между can_preempt() и request()
+                    continue
 
                 logger.debug(f"[idle] Фоновая анимация: {name}")
                 asyncio.create_task(self._play_animation(name, on_frame=self._on_frame))

@@ -4,7 +4,8 @@ import sys
 from pathlib import Path
 
 def check_model():
-    model_path = Path("./models/qwen2.5-7b-instruct-q4_k_m.gguf")
+    root = Path(__file__).resolve().parent.parent
+    model_path = root / "models" / "qwen2.5-7b-instruct-q4_k_m.gguf"
 
     print("=== Проверка модели ===")
     print(f"Путь: {model_path.absolute()}")
@@ -14,7 +15,6 @@ def check_model():
         size_gb = model_path.stat().st_size / (1024**3)
         print(f"Размер: {size_gb:.2f} GB")
 
-        # Проверяем заголовок GGUF
         with open(model_path, 'rb') as f:
             header = f.read(4)
             print(f"Заголовок (первые 4 байта): {header}")
@@ -27,7 +27,7 @@ def check_model():
         print("\n❌ Файл не найден!")
         print("   Проверь папку models/")
 
-        models_dir = Path("./models")
+        models_dir = root / "models"
         if models_dir.exists():
             print(f"\nФайлы в {models_dir}:")
             for f in models_dir.iterdir():

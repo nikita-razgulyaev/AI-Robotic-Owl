@@ -21,9 +21,7 @@ from modules.arbiter import arbiter, Priority
 
 logger = logging.getLogger(__name__)
 
-TICK_HZ = 8  # частота обновления джиттера — заметно ниже частоты серво-цикла,
-             # микродвижение не обязано быть таким же частым, как управляющие кадры
-
+TICK_HZ = 8
 
 class MicroJitter:
     def __init__(
@@ -55,12 +53,11 @@ class MicroJitter:
         # позе покоя) и желаемую амплитуду в градусах. Амплитуда 1-2° —
         # заметно на глаз, но не выглядит как тик/дефект серво.
         self._profiles = servo_profiles or {
-            # индекс: (амплитуда_град, период_сек)
             2: (1.5, 4.0),   # TUNE: голова, тангаж — пример
             16: (1.0, 6.0),  # TUNE: голова, крен — пример
         }
         for idx in self._profiles:
-            self._phases[idx] = idx * 0.7  # разная стартовая фаза на канал, чтобы не дышали синхронно
+            self._phases[idx] = idx * 0.7
 
     def start(self):
         if self._task is not None:
@@ -80,8 +77,7 @@ class MicroJitter:
                 await asyncio.sleep(1.0 / TICK_HZ)
 
                 if not arbiter.can_preempt(Priority.INDEPENDENT):
-                    was_idle = False  # арбитр занят — сбрасываем базу, чтобы
-                                       # при следующем простое не "доехать" рывком
+                    was_idle = False
                     continue
 
                 if not was_idle:

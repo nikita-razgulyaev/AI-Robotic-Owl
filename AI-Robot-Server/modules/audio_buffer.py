@@ -10,21 +10,10 @@ from config.settings import (
 
 logger = logging.getLogger(__name__)
 
-# Минимальная длительность накопленной фразы, чтобы вообще отправлять её в STT.
 MIN_SPEECH_MS = 300
 
-# Окно предзаписи (pre-roll) для триггера speech_start — отдельная, короткая
-# величина, НЕ совпадающая с SILENCE_TIMEOUT_MS (который про таймаут окончания
-# фразы). Раньше ring_buffer ошибочно использовал SILENCE_TIMEOUT_MS и для
-# предзаписи тоже — из-за этого буфер должен был набрать ~800мс подряд ДО
-# триггера, и короткие команды не успевали его заполнить и никогда не
-# распознавались.
 TRIGGER_WINDOW_MS = 300
 
-# Скорость адаптации шумового пола (EMA) к фоновому шуму помещения — считается
-# только по кадрам, которые webrtcvad САМ считает тишиной, чтобы реальная речь
-# рядом с микрофоном не "поднимала" порог. Небольшая альфа — пол подстраивается
-# за пару секунд, но не дёргается от одиночных всплесков.
 NOISE_FLOOR_ALPHA = 0.05
 
 
@@ -58,7 +47,6 @@ class AudioBuffer:
         self.silence_frames = 0
         self.max_silence_frames = int(SILENCE_TIMEOUT_MS / CHUNK_DURATION_MS)
 
-        # Адаптивный фоновый шумовой пол (RMS), см. NOISE_FLOOR_ALPHA выше.
         self._noise_floor = 0.0
 
         logger.info(
@@ -110,14 +98,8 @@ class AudioBuffer:
         is_speech = self._is_voiced(pcm_bytes)
 
         if not self.triggered:
-            # Ждём начала речи
             self.ring_buffer.append(pcm_bytes)
 
-            # Оцениваем только когда буфер набрал полное окно — иначе один
-            # ложно распознанный VAD-кадр в начале (щелчок, гул) даёт
-            # 100%-й voiced ratio на выборке из 1-2 чанков и мгновенно
-            # триггерит speech_start. Сравнивать нужно с maxlen (полным
-            # окном), а не с текущей длиной буфера.
             if len(self.ring_buffer) < self.ring_buffer.maxlen:
                 return "silence", b""
 
@@ -127,14 +109,11 @@ class AudioBuffer:
                 self.triggered = True
                 self.voiced_frames = list(self.ring_buffer)
                 self.ring_buffer.clear()
-                # Отдельный статус именно для МОМЕНТА начала новой фразы —
-                # используется, например, для выбора цели слежения по губам.
                 return "speech_start", b""
 
             return "silence", b""
 
         else:
-            # Речь идёт
             self.voiced_frames.append(pcm_bytes)
 
             if not is_speech:
@@ -143,7 +122,6 @@ class AudioBuffer:
                 self.silence_frames = 0
 
             if self.silence_frames > self.max_silence_frames:
-                # Речь закончилась
                 audio = b"".join(self.voiced_frames)
                 speech_ms = len(self.voiced_frames) * self.chunk_duration_ms
                 self.reset()
